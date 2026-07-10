@@ -642,6 +642,16 @@ fn stable_node_id(chapter: &Chapter, ordinal: usize, evidence: &str) -> String {
 
 const MIN_PUNCTUATION_INSENSITIVE_EVIDENCE_CHARS: usize = 8;
 const MIN_FALLBACK_EVIDENCE_FRAGMENT_CHARS: usize = 12;
+const MIN_CHAIN_EVIDENCE_FRAGMENT_CHARS: usize = 4;
+const MIN_CHAIN_EVIDENCE_TOTAL_CHARS: usize = 16;
+const MAX_CHAIN_EVIDENCE_SPAN_CHARS: usize = 120;
+
+#[derive(Clone, Copy)]
+struct ResolvedEvidenceAnchor {
+    start: usize,
+    end: usize,
+    length: usize,
+}
 
 fn resolve_source_evidence(source: &str, submitted: &str) -> Option<String> {
     let submitted = submitted.trim();
@@ -663,6 +673,10 @@ fn resolve_source_evidence(source: &str, submitted: &str) -> Option<String> {
         }
     }
 
+    if let Some((start, end)) = locate_ordered_fragment_chain(source, submitted) {
+        return Some(expand_source_evidence_end(source, start, end));
+    }
+
     let mut fragments = submitted
         .split(|character: char| !character.is_alphanumeric())
         .map(str::trim)
@@ -678,6 +692,57 @@ fn resolve_source_evidence(source: &str, submitted: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn locate_ordered_fragment_chain(source: &str, submitted: &str) -> Option<(usize, usize)> {
+    let anchors = submitted
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::trim)
+        .filter_map(|fragment| {
+            let length = normalize_evidence_anchor(fragment).len();
+            if length < MIN_CHAIN_EVIDENCE_FRAGMENT_CHARS {
+                return None;
+            }
+            locate_normalized_span(source, fragment, true, true).map(|(start, end)| {
+                ResolvedEvidenceAnchor { start, end, length }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut best = None::<(usize, usize, usize, usize)>;
+    for (index, first) in anchors.iter().enumerate() {
+        let mut end = first.end;
+        let mut total = first.length;
+        let mut count = 1;
+        let mut strongest = first.length;
+        for anchor in anchors.iter().skip(index + 1) {
+            if anchor.start < end
+                || source[first.start..anchor.end].chars().count()
+                    > MAX_CHAIN_EVIDENCE_SPAN_CHARS
+            {
+                continue;
+            }
+            end = anchor.end;
+            total += anchor.length;
+            count += 1;
+            strongest = strongest.max(anchor.length);
+        }
+        if count < 2
+            || total < MIN_CHAIN_EVIDENCE_TOTAL_CHARS
+            || (strongest < MIN_PUNCTUATION_INSENSITIVE_EVIDENCE_CHARS && count < 3)
+        {
+            continue;
+        }
+        let should_replace = best
+            .as_ref()
+            .is_none_or(|(_, _, best_total, best_count)| {
+                total > *best_total || (total == *best_total && count > *best_count)
+            });
+        if should_replace {
+            best = Some((first.start, end, total, count));
+        }
+    }
+    best.map(|(start, end, _, _)| (start, end))
 }
 
 fn locate_normalized_span(
@@ -738,7 +803,10 @@ fn normalize_evidence_anchor(value: &str) -> Vec<char> {
 fn expand_source_evidence_end(source: &str, start: usize, end: usize) -> String {
     let mut expanded_end = end;
     for (offset, character) in source[end..].char_indices() {
-        if character.is_whitespace() || character.is_alphanumeric() {
+        if !matches!(
+            character,
+            '。' | '！' | '？' | '!' | '?' | '…' | '”' | '’' | '"' | '\'' | '）' | ')' | '】' | ']' | '》' | '〉'
+        ) {
             break;
         }
         expanded_end = end + offset + character.len_utf8();
@@ -854,6 +922,27 @@ mod tests {
 
         assert!(chapter.original_text.contains(&nodes[0].source_evidence));
         assert!(nodes[0].source_evidence.contains("适者生存的变异种"));
+    }
+
+    #[test]
+    fn analysis_evidence_recovers_a_contiguous_source_span_around_an_omitted_clause() {
+        let mut chapter = chapter();
+        chapter.original_text = "“这样下去，灭绝是肯定不行的。”\r\n　　许纸想到这，微微面色一动，回到屋里，登上笔记本电脑，打开无线网络，上淘宝定制了一些东西，“看来，得想办法了！”".to_string();
+        let json = r#"{
+          "protagonist_impact_nodes": [{
+            "chapter_index": 1,
+            "presence_kind": "direct",
+            "source_evidence": "“这样下去，灭绝是肯定不行的。”许纸想到这，微微面色一动，回到屋里，登上笔记本电脑，上淘宝定制了一些东西",
+            "narrative_function": "决定为虫猿准备文明火种"
+          }]
+        }"#;
+
+        let nodes = parse_impact_nodes_from_analysis(json, std::slice::from_ref(&chapter))
+            .expect("multiple unique ordered anchors should recover the omitted source clause");
+
+        assert!(chapter.original_text.contains(&nodes[0].source_evidence));
+        assert!(nodes[0].source_evidence.contains("打开无线网络"));
+        assert!(nodes[0].source_evidence.ends_with("上淘宝定制了一些东西"));
     }
 
     #[test]
