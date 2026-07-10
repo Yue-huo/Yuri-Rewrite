@@ -1,6 +1,6 @@
 use crate::domain::{AppState, ChapterBatch, Job};
 use crate::rate_limit::is_rate_limit_retry_exhausted;
-use crate::task_control::AutoRunCleanup;
+use crate::task_control::{AutoRunCleanup, CancellableTaskPermit};
 use crate::{
     analyze_chapters_for_auto, begin_auto_batch_progress, clear_auto_run, create_job,
     emit_job_progress, finish_stopped_auto_run, load_analysis_profile_for_run,
@@ -21,7 +21,7 @@ use crate::{
     is_temporary_gateway_error,
 };
 use rusqlite::{params, OptionalExtension};
-use std::collections::HashSet;
+use std::{collections::HashSet, future::Future};
 use tauri::{AppHandle, State};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +32,20 @@ enum RecoverableAutoRunFailure {
     TemporaryGateway,
     Network,
     ModelFormat,
+}
+
+async fn run_cancellable_auto_stage<T, F>(
+    cancellation: &CancellableTaskPermit<'_>,
+    operation: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(AUTO_RUN_TERMINATED.to_string()),
+        result = operation => result,
+    }
 }
 
 fn paused_recovery_job_type(
@@ -200,6 +214,7 @@ pub(crate) async fn start_analyze_rewrite_batch(
         active_profile_ids.iter().copied(),
         "一键分析改写当前批次",
     )?;
+    let cancellation = state.auto_run_tasks.register(&novel_id)?;
     let current_start_batch_index = batch.batch_index.saturating_sub(1);
     let (resume_from, start_batch_index) =
         prepare_auto_run(&state, &novel_id, profile_ids, current_start_batch_index)?;
@@ -226,13 +241,16 @@ pub(crate) async fn start_analyze_rewrite_batch(
 
     update_auto_run_checkpoint_phase(&state, &novel_id, "analysis", batch.batch_index)?;
     begin_auto_batch_progress(&state, &novel_id, "analysis", 1, 1, &batch.label)?;
-    if let Err(error) = analyze_chapters_for_auto(
-        &state,
-        &novel_id,
-        &analysis_profile,
-        &analysis_api_key,
-        &chapters,
-        Some(batch.batch_index),
+    if let Err(error) = run_cancellable_auto_stage(
+        &cancellation,
+        analyze_chapters_for_auto(
+            &state,
+            &novel_id,
+            &analysis_profile,
+            &analysis_api_key,
+            &chapters,
+            Some(batch.batch_index),
+        ),
     )
     .await
     {
@@ -275,13 +293,16 @@ pub(crate) async fn start_analyze_rewrite_batch(
 
     update_auto_run_checkpoint_phase(&state, &novel_id, "rewrite", batch.batch_index)?;
     begin_auto_batch_progress(&state, &novel_id, "rewrite", 1, 1, &batch.label)?;
-    if let Err(error) = rewrite_chapters_for_auto(
-        &state,
-        &novel_id,
-        &profile,
-        &api_key,
-        &batch.id,
-        Some(batch.batch_index),
+    if let Err(error) = run_cancellable_auto_stage(
+        &cancellation,
+        rewrite_chapters_for_auto(
+            &state,
+            &novel_id,
+            &profile,
+            &api_key,
+            &batch.id,
+            Some(batch.batch_index),
+        ),
     )
     .await
     {
@@ -402,6 +423,7 @@ pub(crate) async fn start_analyze_rewrite_all(
         active_profile_ids.iter().copied(),
         "一键分析改写",
     )?;
+    let cancellation = state.auto_run_tasks.register(&novel_id)?;
     let (resume_from, start_batch_index) = prepare_auto_run(
         &state,
         &novel_id,
@@ -478,13 +500,16 @@ pub(crate) async fn start_analyze_rewrite_all(
         if chapters.is_empty() {
             continue;
         }
-        if let Err(error) = analyze_chapters_for_auto(
-            &state,
-            &novel_id,
-            &analysis_profile,
-            &analysis_api_key,
-            &chapters,
-            Some(current),
+        if let Err(error) = run_cancellable_auto_stage(
+            &cancellation,
+            analyze_chapters_for_auto(
+                &state,
+                &novel_id,
+                &analysis_profile,
+                &analysis_api_key,
+                &chapters,
+                Some(current),
+            ),
         )
         .await
         {
@@ -544,13 +569,16 @@ pub(crate) async fn start_analyze_rewrite_all(
             &rewrite_message,
         )?;
         emit_job_progress(&app, &job, "running", completed_in_range, &rewrite_message);
-        if let Err(error) = rewrite_chapters_for_auto(
-            &state,
-            &novel_id,
-            &profile,
-            &api_key,
-            &batch.id,
-            Some(current),
+        if let Err(error) = run_cancellable_auto_stage(
+            &cancellation,
+            rewrite_chapters_for_auto(
+                &state,
+                &novel_id,
+                &profile,
+                &api_key,
+                &batch.id,
+                Some(current),
+            ),
         )
         .await
         {
@@ -635,13 +663,28 @@ pub(crate) fn terminate_analyze_rewrite_all(
     novel_id: String,
     state: State<AppState>,
 ) -> Result<Job, String> {
-    request_auto_run_stop(&state, &novel_id, "terminate_requested")
+    let job = request_auto_run_stop(&state, &novel_id, "terminate_requested")?;
+    state.auto_run_tasks.cancel(&novel_id)?;
+    Ok(job)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::ChapterBatch;
+    use crate::task_control::CancellableTaskRegistry;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     fn sample_batch(index: i64) -> ChapterBatch {
         ChapterBatch {
@@ -710,6 +753,32 @@ mod tests {
                 Some(RecoverableAutoRunFailure::ContentFilter)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn terminating_auto_run_drops_in_flight_stage_immediately() {
+        let registry = CancellableTaskRegistry::default();
+        let cancellation = registry.register("novel-1").expect("register task");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let operation_dropped = dropped.clone();
+        let operation = async move {
+            let _drop_flag = DropFlag(operation_dropped);
+            std::future::pending::<()>().await;
+            Ok::<(), String>(())
+        };
+        let cancel = async {
+            tokio::task::yield_now().await;
+            registry.cancel("novel-1").expect("cancel task")
+        };
+
+        let (result, cancelled) = tokio::join!(
+            run_cancellable_auto_stage(&cancellation, operation),
+            cancel
+        );
+
+        assert!(cancelled);
+        assert_eq!(result.unwrap_err(), AUTO_RUN_TERMINATED);
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[test]

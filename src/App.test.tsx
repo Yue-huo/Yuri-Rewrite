@@ -134,6 +134,9 @@ function installDefaultCommands() {
     if (command === "start_analyze_rewrite_batch") {
       return { id: "job-auto-batch", novel_id: "novel-1", job_type: "auto_batch", status: "completed", current_chapter: 1, total_chapters: 1, message: "当前批次完成" };
     }
+    if (command === "terminate_analyze_rewrite_all") {
+      return { id: "job-auto", novel_id: "novel-1", job_type: "auto", status: "terminating", current_chapter: 0, total_chapters: 1, message: "正在终止" };
+    }
     if (command === "save_model_profile") return profile;
     if (command === "delete_local_data") return { warnings: [] };
     if (command === "set_auto_continue_enabled") {
@@ -909,6 +912,46 @@ describe("App feature behavior", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /导入 TXT/ })).toBeDisabled());
     expect(screen.getByRole("button", { name: "第二本" })).toBeDisabled();
     expect(screen.getByRole("combobox", { name: "当前批次" })).toBeEnabled();
+  });
+
+  it("keeps the auto task locked until termination is confirmed", async () => {
+    render(<App />);
+    await screen.findByRole("heading", { name: "测试小说" });
+    act(() => {
+      mocks.progressCallback?.({
+        id: "auto-1",
+        novel_id: "novel-1",
+        job_type: "auto",
+        status: "running",
+        current_chapter: 0,
+        total_chapters: 2,
+        message: "运行中"
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "终止" }));
+
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith(
+      "terminate_analyze_rewrite_all",
+      { novelId: "novel-1" }
+    ));
+    expect(screen.getByRole("button", { name: "终止中" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "一键分析改写" })).toBeDisabled();
+
+    act(() => {
+      mocks.progressCallback?.({
+        id: "auto-1",
+        novel_id: "novel-1",
+        job_type: "auto",
+        status: "terminated",
+        current_chapter: 0,
+        total_chapters: 2,
+        message: "已终止"
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "终止中" })).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "一键分析改写" })).toBeEnabled();
   });
 
   it("shows detailed progress and pause controls for the current-batch auto task", async () => {

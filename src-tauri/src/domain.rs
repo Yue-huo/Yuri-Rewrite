@@ -17,6 +17,7 @@ pub(crate) struct AppState {
     pub(crate) auto_runs: Mutex<HashMap<String, AutoRunControl>>,
     pub(crate) auto_run_progress: Mutex<HashMap<String, AutoRunProgressState>>,
     pub(crate) active_tasks: ActiveTaskRegistry,
+    pub(crate) auto_run_tasks: CancellableTaskRegistry,
     pub(crate) single_rewrite_tasks: CancellableTaskRegistry,
     pub(crate) rate_limits: RateLimitCoordinator,
 }

@@ -107,6 +107,7 @@ pub fn run() {
                 auto_runs: Mutex::new(restored_auto_runs),
                 auto_run_progress: Mutex::new(HashMap::new()),
                 active_tasks: ActiveTaskRegistry::default(),
+                auto_run_tasks: CancellableTaskRegistry::default(),
                 single_rewrite_tasks: CancellableTaskRegistry::default(),
                 rate_limits: RateLimitCoordinator::default(),
             });
@@ -6445,7 +6446,7 @@ fn request_auto_run_stop(
         let message = if hold_paused_run {
             "已由用户保持暂停；继续时仅处理未完成分片。"
         } else if status == "terminate_requested" {
-            "正在终止一键分析改写，当前未输出批次将不会保存。"
+            "正在立即终止一键分析改写；活动模型请求将取消，当前未输出批次不会保存。"
         } else {
             "正在暂停一键分析改写，已完成分片会保留，继续时仅处理未完成分片。"
         };

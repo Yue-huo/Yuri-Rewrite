@@ -1693,12 +1693,14 @@ export default function App() {
     try {
       const result = await invoke("terminate_analyze_rewrite_all", { novelId });
       setJob(result);
-      setAutoRunState("idle");
-      setAutoRunMode(null);
+      if (result.status === "terminated") {
+        setAutoRunState("idle");
+        setAutoRunMode(null);
+      } else {
+        setAutoRunState("stopping");
+      }
       showNotice(result.message);
     } catch (error) {
-      setAutoRunState("idle");
-      setAutoRunMode(null);
       showNotice(String(error));
     } finally {
       setAutoControlBusy(false);
@@ -2646,9 +2648,9 @@ export default function App() {
                         ? "继续"
                         : "暂停"}
                   </button>
-                  <button className="task-control-danger" onClick={terminateAnalyzeRewriteAll} disabled={autoControlBusy} title="终止一键分析改写">
-                    {autoControlBusy ? <Loader2 className="spin" size={17} /> : <Square size={17} />}
-                    终止
+                  <button className="task-control-danger" onClick={terminateAnalyzeRewriteAll} disabled={autoControlBusy || autoRunState === "stopping"} title="终止一键分析改写">
+                    {autoControlBusy || autoRunState === "stopping" ? <Loader2 className="spin" size={17} /> : <Square size={17} />}
+                    {autoRunState === "stopping" ? "终止中" : "终止"}
                   </button>
                 </>
               )}
