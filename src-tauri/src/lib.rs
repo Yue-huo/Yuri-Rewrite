@@ -666,8 +666,9 @@ async fn retry_analysis_shard_after_parse_error(
     let base_prompt =
         build_batch_analysis_prompt_with_identity(shard, retry_context.trim(), &identity_context);
     let prompt = format!(
-        "{}\n\n上一次无法解析的输出如下，仅供你避开格式错误，不要照抄：\n{}",
+        "{}\n\n上一次输出的具体校验失败原因：\n{}\n\n必须针对以上原因修复。若是 source_evidence 问题，请从对应章节原文的同一处连续复制一个短片段，保留原文标点，不要拼接相邻句或自行增加引号。\n\n上一次无法解析的输出如下，仅供修复，不要原样照抄：\n{}",
         base_prompt,
+        parse_error,
         truncate_text(bad_output, 12_000)
     );
     let output = generate_text(

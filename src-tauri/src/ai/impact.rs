@@ -55,15 +55,16 @@ fn canonicalize_candidate_nodes(
                 node.chapter_index
             ));
         }
-        if node.source_evidence.trim().is_empty()
-            || !normalized_contains(&chapter.original_text, &node.source_evidence)
-        {
+        let submitted_evidence = node.source_evidence.trim().to_string();
+        let Some(source_evidence) =
+            resolve_source_evidence(&chapter.original_text, &submitted_evidence)
+        else {
             return Err(format!(
-                "章节 {} 的主角影响节点证据无法在原文中定位：{}",
-                chapter.index,
-                node.source_evidence.trim()
+                "章节 {} 的主角影响节点证据无法在原文中定位可靠的连续原文锚点：{}",
+                chapter.index, submitted_evidence
             ));
-        }
+        };
+        node.source_evidence = source_evidence;
         if node.narrative_function.trim().is_empty() {
             return Err(format!(
                 "章节 {} 的主角影响节点缺少叙事功能。",
@@ -639,9 +640,110 @@ fn stable_node_id(chapter: &Chapter, ordinal: usize, evidence: &str) -> String {
     format!("impact-{}-{ordinal}-{short}", chapter.id)
 }
 
-fn normalized_contains(haystack: &str, needle: &str) -> bool {
-    let normalized_needle = normalize_evidence(needle);
-    !normalized_needle.is_empty() && normalize_evidence(haystack).contains(&normalized_needle)
+const MIN_PUNCTUATION_INSENSITIVE_EVIDENCE_CHARS: usize = 8;
+const MIN_FALLBACK_EVIDENCE_FRAGMENT_CHARS: usize = 12;
+
+fn resolve_source_evidence(source: &str, submitted: &str) -> Option<String> {
+    let submitted = submitted.trim();
+    if submitted.is_empty() {
+        return None;
+    }
+    if source.contains(submitted) {
+        return Some(submitted.to_string());
+    }
+
+    if let Some((start, end)) = locate_normalized_span(source, submitted, false, false) {
+        return Some(source[start..end].trim().to_string());
+    }
+
+    let submitted_anchor = normalize_evidence_anchor(submitted);
+    if submitted_anchor.len() >= MIN_PUNCTUATION_INSENSITIVE_EVIDENCE_CHARS {
+        if let Some((start, end)) = locate_normalized_span(source, submitted, true, true) {
+            return Some(expand_source_evidence_end(source, start, end));
+        }
+    }
+
+    let mut fragments = submitted
+        .split(|character: char| !character.is_alphanumeric())
+        .map(str::trim)
+        .filter(|fragment| {
+            normalize_evidence_anchor(fragment).len() >= MIN_FALLBACK_EVIDENCE_FRAGMENT_CHARS
+        })
+        .collect::<Vec<_>>();
+    fragments.sort_by_key(|fragment| std::cmp::Reverse(normalize_evidence_anchor(fragment).len()));
+    fragments.dedup();
+    for fragment in fragments {
+        if let Some((start, end)) = locate_normalized_span(source, fragment, true, true) {
+            return Some(expand_source_evidence_end(source, start, end));
+        }
+    }
+    None
+}
+
+fn locate_normalized_span(
+    source: &str,
+    submitted: &str,
+    ignore_punctuation: bool,
+    require_unique: bool,
+) -> Option<(usize, usize)> {
+    let (source_chars, source_ranges) = normalize_evidence_with_ranges(source, ignore_punctuation);
+    let (submitted_chars, _) = normalize_evidence_with_ranges(submitted, ignore_punctuation);
+    if submitted_chars.is_empty() || submitted_chars.len() > source_chars.len() {
+        return None;
+    }
+
+    let mut matched_start = None;
+    for start in 0..=source_chars.len() - submitted_chars.len() {
+        if source_chars[start..start + submitted_chars.len()] == submitted_chars {
+            if require_unique && matched_start.is_some() {
+                return None;
+            }
+            matched_start = Some(start);
+            if !require_unique {
+                break;
+            }
+        }
+    }
+    let start = matched_start?;
+    Some((
+        source_ranges[start].0,
+        source_ranges[start + submitted_chars.len() - 1].1,
+    ))
+}
+
+fn normalize_evidence_with_ranges(
+    value: &str,
+    ignore_punctuation: bool,
+) -> (Vec<char>, Vec<(usize, usize)>) {
+    let mut normalized = Vec::new();
+    let mut ranges = Vec::new();
+    for (start, character) in value.char_indices() {
+        if character.is_whitespace() || (ignore_punctuation && !character.is_alphanumeric()) {
+            continue;
+        }
+        normalized.push(if character.is_ascii() {
+            character.to_ascii_lowercase()
+        } else {
+            character
+        });
+        ranges.push((start, start + character.len_utf8()));
+    }
+    (normalized, ranges)
+}
+
+fn normalize_evidence_anchor(value: &str) -> Vec<char> {
+    normalize_evidence_with_ranges(value, true).0
+}
+
+fn expand_source_evidence_end(source: &str, start: usize, end: usize) -> String {
+    let mut expanded_end = end;
+    for (offset, character) in source[end..].char_indices() {
+        if character.is_whitespace() || character.is_alphanumeric() {
+            break;
+        }
+        expanded_end = end + offset + character.len_utf8();
+    }
+    source[start..expanded_end].trim().to_string()
 }
 
 fn normalize_evidence(value: &str) -> String {
@@ -707,6 +809,80 @@ mod tests {
         let nodes = parse_impact_nodes_from_analysis(json, &[chapter()]).expect("valid nodes");
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].node_id.starts_with("impact-c1-1-"));
+    }
+
+    #[test]
+    fn analysis_evidence_recovers_adjacent_source_text_with_changed_quotes() {
+        let mut chapter = chapter();
+        chapter.original_text =
+            "在下午五点多，许纸倒是忽然被叫住了：\r\n　　“喂，你是许纸？？”\r\n　　许纸扭头。"
+                .to_string();
+        let json = r#"{
+          "protagonist_impact_nodes": [{
+            "chapter_index": 1,
+            "presence_kind": "direct",
+            "source_evidence": "“许纸倒是忽然被叫住了：'喂，你是许纸？'”",
+            "narrative_function": "引出旧识重逢"
+          }]
+        }"#;
+
+        let nodes = parse_impact_nodes_from_analysis(json, std::slice::from_ref(&chapter))
+            .expect("punctuation-only drift should resolve locally");
+
+        assert_eq!(
+            nodes[0].source_evidence,
+            "许纸倒是忽然被叫住了：\r\n　　“喂，你是许纸？？”"
+        );
+        assert!(chapter.original_text.contains(&nodes[0].source_evidence));
+    }
+
+    #[test]
+    fn analysis_evidence_reduces_stitched_paraphrase_to_unique_source_anchor() {
+        let mut chapter = chapter();
+        chapter.original_text = "许纸深呼吸一口气，觉得应该捏死它。可是想想还是算了，毕竟优胜劣汰了那么多，才诞生一个适者生存的变异种，现在杀不得。".to_string();
+        let json = r#"{
+          "protagonist_impact_nodes": [{
+            "chapter_index": 1,
+            "presence_kind": "direct",
+            "source_evidence": "许纸深呼吸一口气，觉得应该捏死它，但想想还是算了，毕竟优胜劣汰了那么多，才诞生一个适者生存的变异种",
+            "narrative_function": "决定保留变异种"
+          }]
+        }"#;
+
+        let nodes = parse_impact_nodes_from_analysis(json, std::slice::from_ref(&chapter))
+            .expect("a long unique exact fragment should remain a reliable anchor");
+
+        assert!(chapter.original_text.contains(&nodes[0].source_evidence));
+        assert!(nodes[0].source_evidence.contains("适者生存的变异种"));
+    }
+
+    #[test]
+    fn analysis_evidence_still_rejects_fabricated_or_ambiguous_anchors() {
+        let mut chapter = chapter();
+        chapter.original_text = "许纸缓缓推开大门走了进来。许纸缓缓推开大门走了进来。".to_string();
+        let fabricated = r#"{
+          "protagonist_impact_nodes": [{
+            "chapter_index": 1,
+            "presence_kind": "direct",
+            "source_evidence": "许纸从窗外飞了进来",
+            "narrative_function": "伪造事件"
+          }]
+        }"#;
+        let ambiguous = r#"{
+          "protagonist_impact_nodes": [{
+            "chapter_index": 1,
+            "presence_kind": "direct",
+            "source_evidence": "“许纸缓缓推开大门走了进来”",
+            "narrative_function": "重复场景"
+          }]
+        }"#;
+
+        assert!(
+            parse_impact_nodes_from_analysis(fabricated, std::slice::from_ref(&chapter)).is_err()
+        );
+        assert!(
+            parse_impact_nodes_from_analysis(ambiguous, std::slice::from_ref(&chapter)).is_err()
+        );
     }
 
     #[test]
