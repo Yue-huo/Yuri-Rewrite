@@ -31,10 +31,20 @@ fn canonicalize_candidate_nodes(
     candidates: Vec<Value>,
     chapters: &[Chapter],
 ) -> Result<Vec<SourceImpactNode>, String> {
-    let chapters_by_index = chapters
+    let chapter_indexes = chapters
         .iter()
-        .map(|chapter| (chapter.index, chapter))
-        .collect::<HashMap<_, _>>();
+        .map(|chapter| chapter.index)
+        .collect::<HashSet<_>>();
+    let uses_local_chapter_ordinals = candidates.iter().any(|candidate| {
+        candidate
+            .get("chapter_index")
+            .and_then(Value::as_i64)
+            .is_some_and(|index| {
+                !chapter_indexes.contains(&index)
+                    && index >= 1
+                    && usize::try_from(index).is_ok_and(|index| index <= chapters.len())
+            })
+    });
     let mut ordinals = HashMap::<i64, usize>::new();
     let mut seen = HashSet::new();
     let mut nodes = Vec::new();
@@ -42,12 +52,6 @@ fn canonicalize_candidate_nodes(
     for candidate in candidates {
         let mut node: SourceImpactNode = serde_json::from_value(candidate)
             .map_err(|error| format!("主角影响节点字段无效：{error}"))?;
-        let chapter = chapters_by_index.get(&node.chapter_index).ok_or_else(|| {
-            format!(
-                "主角影响节点引用了当前分片之外的章节：{}",
-                node.chapter_index
-            )
-        })?;
         validate_presence_kind(&node.presence_kind)?;
         if !node.confidence.is_finite() || !(0.0..=1.0).contains(&node.confidence) {
             return Err(format!(
@@ -56,14 +60,13 @@ fn canonicalize_candidate_nodes(
             ));
         }
         let submitted_evidence = node.source_evidence.trim().to_string();
-        let Some(source_evidence) =
-            resolve_source_evidence(&chapter.original_text, &submitted_evidence)
-        else {
-            return Err(format!(
-                "章节 {} 的主角影响节点证据无法在原文中定位可靠的连续原文锚点：{}",
-                chapter.index, submitted_evidence
-            ));
-        };
+        let (chapter, source_evidence) = resolve_source_chapter(
+            chapters,
+            node.chapter_index,
+            &submitted_evidence,
+            uses_local_chapter_ordinals,
+        )?;
+        node.chapter_index = chapter.index;
         node.source_evidence = source_evidence;
         if node.narrative_function.trim().is_empty() {
             return Err(format!(
@@ -96,6 +99,56 @@ fn canonicalize_candidate_nodes(
     }
     nodes.sort_by_key(|node| (node.chapter_index, node.ordinal));
     Ok(nodes)
+}
+
+fn resolve_source_chapter<'a>(
+    chapters: &'a [Chapter],
+    submitted_chapter_index: i64,
+    submitted_evidence: &str,
+    uses_local_chapter_ordinals: bool,
+) -> Result<(&'a Chapter, String), String> {
+    let matches = chapters
+        .iter()
+        .filter_map(|chapter| {
+            resolve_source_evidence(&chapter.original_text, submitted_evidence)
+                .map(|evidence| (chapter, evidence))
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return Err(format!(
+            "模型标注章节 {} 的主角影响节点证据无法在当前分片任何章节中定位可靠原文锚点：{}",
+            submitted_chapter_index, submitted_evidence
+        ));
+    }
+    if matches.len() == 1 {
+        return Ok(matches.into_iter().next().expect("one evidence match"));
+    }
+
+    let local_chapter = submitted_chapter_index
+        .checked_sub(1)
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| chapters.get(index));
+    let absolute_chapter = chapters
+        .iter()
+        .find(|chapter| chapter.index == submitted_chapter_index);
+    let preferred = if uses_local_chapter_ordinals {
+        local_chapter.or(absolute_chapter)
+    } else {
+        absolute_chapter.or(local_chapter)
+    };
+    if let Some(preferred) = preferred {
+        if let Some((chapter, evidence)) = matches
+            .iter()
+            .find(|(chapter, _)| chapter.id == preferred.id)
+        {
+            return Ok((*chapter, evidence.clone()));
+        }
+    }
+
+    Err(format!(
+        "模型标注章节 {} 的主角影响节点证据同时匹配当前分片多个章节，无法安全归属：{}",
+        submitted_chapter_index, submitted_evidence
+    ))
 }
 
 pub(crate) fn parse_impact_graph(content: &str) -> Vec<SourceImpactNode> {
@@ -859,6 +912,15 @@ mod tests {
         }
     }
 
+    fn indexed_chapter(index: i64, original_text: &str) -> Chapter {
+        let mut chapter = chapter();
+        chapter.id = format!("c{index}");
+        chapter.index = index;
+        chapter.title = format!("第{index}章");
+        chapter.original_text = original_text.to_string();
+        chapter
+    }
+
     #[test]
     fn analysis_nodes_require_real_source_evidence_and_get_stable_ids() {
         let json = r#"{
@@ -877,6 +939,83 @@ mod tests {
         let nodes = parse_impact_nodes_from_analysis(json, &[chapter()]).expect("valid nodes");
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].node_id.starts_with("impact-c1-1-"));
+    }
+
+    #[test]
+    fn analysis_nodes_infer_absolute_chapters_from_local_shard_ordinals() {
+        let chapters = [
+            indexed_chapter(8, "吉尔伽美什坐在王座上回忆智慧巨兽。"),
+            indexed_chapter(9, "许纸正在吃饭，并不想理会他的祈求。"),
+            indexed_chapter(10, "许纸放下橙子，慢慢大步走进了沙盘。"),
+        ];
+        let json = r#"{
+          "protagonist_impact_nodes": [
+            {"chapter_index":1,"presence_kind":"mentioned","source_evidence":"吉尔伽美什坐在王座上回忆智慧巨兽","narrative_function":"回忆造物主"},
+            {"chapter_index":2,"presence_kind":"direct","source_evidence":"许纸正在吃饭，并不想理会他的祈求","narrative_function":"暂不介入"},
+            {"chapter_index":3,"presence_kind":"direct","source_evidence":"许纸放下橙子，慢慢大步走进了沙盘","narrative_function":"进入沙盘"}
+          ]
+        }"#;
+
+        let nodes = parse_impact_nodes_from_analysis(json, &chapters)
+            .expect("source evidence should determine absolute chapter indexes");
+
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.chapter_index)
+                .collect::<Vec<_>>(),
+            [8, 9, 10]
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.chapter_id.as_str())
+                .collect::<Vec<_>>(),
+            ["c8", "c9", "c10"]
+        );
+    }
+
+    #[test]
+    fn analysis_node_uses_unique_evidence_over_a_wrong_absolute_index() {
+        let chapters = [
+            indexed_chapter(8, "吉尔伽美什回忆智慧巨兽。"),
+            indexed_chapter(9, "许纸正在吃饭，并不想理会他。"),
+        ];
+        let json = r#"{
+          "protagonist_impact_nodes": [{
+            "chapter_index":8,
+            "presence_kind":"direct",
+            "source_evidence":"许纸正在吃饭，并不想理会他",
+            "narrative_function":"暂不介入"
+          }]
+        }"#;
+
+        let nodes = parse_impact_nodes_from_analysis(json, &chapters)
+            .expect("unique source evidence should correct the model index");
+
+        assert_eq!(nodes[0].chapter_index, 9);
+        assert_eq!(nodes[0].chapter_id, "c9");
+    }
+
+    #[test]
+    fn analysis_node_rejects_ambiguous_evidence_without_a_safe_chapter_hint() {
+        let chapters = [
+            indexed_chapter(8, "许纸点点头，随后离开。"),
+            indexed_chapter(9, "许纸点点头，随后离开。"),
+        ];
+        let json = r#"{
+          "protagonist_impact_nodes": [{
+            "chapter_index":99,
+            "presence_kind":"direct",
+            "source_evidence":"许纸点点头，随后离开",
+            "narrative_function":"离场"
+          }]
+        }"#;
+
+        let error = parse_impact_nodes_from_analysis(json, &chapters)
+            .expect_err("ambiguous evidence must not be assigned arbitrarily");
+
+        assert!(error.contains("同时匹配当前分片多个章节"));
     }
 
     #[test]
