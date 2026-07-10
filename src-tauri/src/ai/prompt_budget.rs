@@ -161,6 +161,51 @@ pub(crate) fn format_execution_contract(
     )
 }
 
+pub(crate) fn format_repair_contract(
+    plan: &RewritePlan,
+    chapter_indexes: Option<&HashSet<i64>>,
+    failed_obligation_ids: &HashSet<String>,
+) -> String {
+    if chapter_indexes.is_none() {
+        return format_execution_contract(plan, None);
+    }
+    let include_chapter =
+        |chapter_index: i64| chapter_indexes.is_none_or(|indexes| indexes.contains(&chapter_index));
+    let obligations = plan
+        .obligations
+        .iter()
+        .filter(|obligation| {
+            include_chapter(obligation.chapter_index)
+                && (failed_obligation_ids.is_empty()
+                    || failed_obligation_ids.contains(&obligation.obligation_id))
+        })
+        .collect::<Vec<_>>();
+    let selected_ids = obligations
+        .iter()
+        .map(|obligation| obligation.obligation_id.as_str())
+        .collect::<HashSet<_>>();
+    let planned_state_updates = plan
+        .planned_state_updates
+        .iter()
+        .filter(|state| {
+            (state.chapter_index == 0 || include_chapter(state.chapter_index))
+                && (selected_ids.is_empty()
+                    || state
+                        .source_obligation_ids
+                        .iter()
+                        .any(|id| selected_ids.contains(id.as_str())))
+        })
+        .collect::<Vec<_>>();
+    compact_json(
+        &json!({
+            "plan_version": plan.plan_version,
+            "obligations": obligations,
+            "planned_state_updates": planned_state_updates,
+        }),
+        "{}",
+    )
+}
+
 fn relevant_thread_keys(nodes: &[SourceImpactNode], plan: Option<&RewritePlan>) -> HashSet<String> {
     let mut keys = nodes
         .iter()
@@ -404,5 +449,40 @@ mod tests {
         assert!(!compact.contains(IMPACT_GRAPH_ASSET_KIND));
         assert!(!compact.contains(REWRITE_CONTINUITY_ASSET_KIND));
         assert!(!compact.contains("不应重复进入通用上下文"));
+    }
+
+    #[test]
+    fn repair_contract_keeps_only_failed_obligations_in_target_chapters() {
+        let make_obligation = |id: &str, chapter_index: i64| RewriteObligation {
+            obligation_id: id.to_string(),
+            node_id: format!("N-{id}"),
+            chapter_index,
+            rule_ids: Vec::new(),
+            preserve: Vec::new(),
+            required_changes: vec![format!("修复-{id}")],
+            deep_delta_categories: Vec::new(),
+            forbidden_regressions: Vec::new(),
+            downstream_effects: Vec::new(),
+            planned_state_updates: Vec::new(),
+        };
+        let plan = RewritePlan {
+            plan_version: "protagonist-graph-v1".to_string(),
+            graph_additions: Vec::new(),
+            obligations: vec![
+                make_obligation("O-1", 1),
+                make_obligation("O-2", 1),
+                make_obligation("O-3", 2),
+            ],
+            planned_state_updates: Vec::new(),
+            cross_shard_dependencies: Vec::new(),
+        };
+        let chapters = HashSet::from([1]);
+        let failed = HashSet::from(["O-2".to_string()]);
+
+        let contract = format_repair_contract(&plan, Some(&chapters), &failed);
+
+        assert!(!contract.contains("O-1"));
+        assert!(contract.contains("O-2"));
+        assert!(!contract.contains("O-3"));
     }
 }

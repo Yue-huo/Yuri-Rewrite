@@ -169,6 +169,7 @@ pub(crate) fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             pause_kind TEXT NOT NULL DEFAULT 'unknown',
             phase TEXT,
             batch_index INTEGER,
+            rewrite_run_id TEXT,
             profile_ids TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -281,6 +282,7 @@ pub(crate) fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         "pause_kind",
         "TEXT NOT NULL DEFAULT 'unknown'",
     )?;
+    migrations::ensure_column(conn, "auto_run_checkpoints", "rewrite_run_id", "TEXT")?;
     migrations::migrate_api_keys_to_keyring(conn)?;
     Ok(())
 }
@@ -800,7 +802,9 @@ mod tests {
         conn.execute("DELETE FROM novels WHERE id = 'novel-1'", [])
             .unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM rewrite_contracts", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM rewrite_contracts", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(count, 0);
     }

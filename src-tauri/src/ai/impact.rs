@@ -257,6 +257,7 @@ pub(crate) fn build_rewrite_plan_prompt(
 7. source_evidence 必须逐字摘自原文，不得概括或改写。
 8. 如果提供“当前改写稿”，比较其与原文：已经满足深层变化的节点仍保留一项验收义务，并在 preserve 中写明保持现有处理；未满足节点和本次新要求进入修复义务，避免破坏已经成立的改写。
 9. 阅读前序分片契约。如果当前义务依赖前序 node_id、obligation_id、thread_key 或计划状态，把稳定标识写入 cross_shard_dependencies；无依赖时返回空数组。
+10. 每个 planned_state_updates 项必须包含 thread_key、state_type、value、当前分片 chapter_index 和非空 source_obligation_ids；义务内部的状态必须把该义务自身 ID 列为来源。
 
 允许的深层变化类别：{}
 
@@ -274,7 +275,13 @@ pub(crate) fn build_rewrite_plan_prompt(
     "deep_delta_categories": ["other_reaction"],
     "forbidden_regressions": ["不能引入的退化"],
     "downstream_effects": ["后续必须承接的影响"],
-    "planned_state_updates": []
+    "planned_state_updates": [{{
+      "thread_key": "关系线",
+      "state_type": "边界或承诺类型",
+      "value": "本章建立的最新状态",
+      "chapter_index": 1,
+      "source_obligation_ids": ["O-节点ID"]
+    }}]
   }}],
   "planned_state_updates": [],
   "cross_shard_dependencies": []
@@ -364,10 +371,25 @@ pub(crate) fn parse_and_validate_rewrite_plan(
         .into_iter()
         .zip(additions.iter().map(|node| node.node_id.clone()))
         .collect::<HashMap<_, _>>();
+    let mut obligation_replacements = HashMap::new();
     for obligation in &mut plan.obligations {
         if let Some(replacement) = replacement_ids.get(&obligation.node_id) {
+            let previous_obligation_id = obligation.obligation_id.clone();
             obligation.node_id = replacement.clone();
             obligation.obligation_id = format!("O-{replacement}");
+            obligation_replacements
+                .insert(previous_obligation_id, obligation.obligation_id.clone());
+        }
+    }
+    for state in plan.planned_state_updates.iter_mut().chain(
+        plan.obligations
+            .iter_mut()
+            .flat_map(|obligation| obligation.planned_state_updates.iter_mut()),
+    ) {
+        for source_id in &mut state.source_obligation_ids {
+            if let Some(replacement) = obligation_replacements.get(source_id) {
+                *source_id = replacement.clone();
+            }
         }
     }
     plan.graph_additions = additions;
@@ -408,7 +430,75 @@ pub(crate) fn parse_and_validate_rewrite_plan(
     if !missing.is_empty() {
         return Err(format!("改写契约遗漏主角节点：{}", missing.join("、")));
     }
+    validate_plan_state_updates(&plan, chapters)?;
     Ok(plan)
+}
+
+fn validate_plan_state_updates(plan: &RewritePlan, chapters: &[Chapter]) -> Result<(), String> {
+    let chapter_indexes = chapters
+        .iter()
+        .map(|chapter| chapter.index)
+        .collect::<HashSet<_>>();
+    let obligation_ids = plan
+        .obligations
+        .iter()
+        .map(|obligation| obligation.obligation_id.as_str())
+        .collect::<HashSet<_>>();
+    for (owner, state) in plan
+        .planned_state_updates
+        .iter()
+        .map(|state| (None, state))
+        .chain(plan.obligations.iter().flat_map(|obligation| {
+            obligation
+                .planned_state_updates
+                .iter()
+                .map(move |state| (Some(obligation.obligation_id.as_str()), state))
+        }))
+    {
+        if state.thread_key.trim().is_empty()
+            || state.state_type.trim().is_empty()
+            || state.value.trim().is_empty()
+        {
+            return Err("计划状态必须包含 thread_key、state_type 和 value。".to_string());
+        }
+        if !chapter_indexes.contains(&state.chapter_index) {
+            return Err(format!(
+                "计划状态 {} / {} 引用了当前分片之外的章节 {}。",
+                state.thread_key, state.state_type, state.chapter_index
+            ));
+        }
+        let normalized_source_count = state
+            .source_obligation_ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect::<HashSet<_>>()
+            .len();
+        if state.source_obligation_ids.is_empty()
+            || normalized_source_count != state.source_obligation_ids.len()
+            || state
+                .source_obligation_ids
+                .iter()
+                .any(|id| !obligation_ids.contains(id.trim()))
+        {
+            return Err(format!(
+                "计划状态 {} / {} 缺少合法来源义务 ID。",
+                state.thread_key, state.state_type
+            ));
+        }
+        if let Some(owner) = owner {
+            if !state
+                .source_obligation_ids
+                .iter()
+                .any(|id| id.trim() == owner)
+            {
+                return Err(format!(
+                    "义务 {owner} 的计划状态没有把自身列入 source_obligation_ids。"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_obligation(obligation: &RewriteObligation) -> Result<(), String> {
@@ -578,6 +668,7 @@ fn validate_presence_kind(kind: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{ParsedChapterRewrite, ReviewCoverageItem, RewriteStateUpdate};
 
     fn chapter() -> Chapter {
         Chapter {
@@ -657,6 +748,45 @@ mod tests {
     }
 
     #[test]
+    fn planner_addition_gets_stable_ids_and_remaps_state_provenance() {
+        let chapter = chapter();
+        let output = r#"{
+          "plan_version":"protagonist-graph-v1",
+          "graph_additions":[{
+            "node_id":"new-1-1",
+            "chapter_index":1,
+            "presence_kind":"mentioned",
+            "source_evidence":"药老看了他一眼",
+            "narrative_function":"他人观察",
+            "confidence":0.9
+          }],
+          "obligations":[{
+            "obligation_id":"O-new-1-1",
+            "node_id":"new-1-1",
+            "chapter_index":1,
+            "rule_ids":["R3_PROTAGONIST_NODE_DELTA"],
+            "required_changes":["让药老的观察反应产生可见差异"],
+            "deep_delta_categories":["other_reaction"],
+            "planned_state_updates":[{
+              "thread_key":"师徒",
+              "state_type":"观察",
+              "value":"药老开始留意她的表达",
+              "chapter_index":1,
+              "source_obligation_ids":["O-new-1-1"]
+            }]
+          }]
+        }"#;
+
+        let plan = parse_and_validate_rewrite_plan(output, &[chapter], &[]).unwrap();
+
+        assert!(plan.graph_additions[0].node_id.starts_with("impact-c1-1-"));
+        assert_eq!(
+            plan.obligations[0].planned_state_updates[0].source_obligation_ids,
+            vec![plan.obligations[0].obligation_id.clone()]
+        );
+    }
+
+    #[test]
     fn graph_merge_deduplicates_same_source_evidence() {
         let chapter = chapter();
         let nodes = parse_impact_nodes_from_analysis(
@@ -687,5 +817,156 @@ mod tests {
             .iter()
             .any(|link| link.kind == "same_thread" && link.target == "N-2"));
         assert!(merged[1].links.is_empty());
+    }
+
+    #[test]
+    fn protagonist_scenario_matrix_reaches_contract_and_coverage_gate() {
+        let mut chapter = chapter();
+        chapter.original_text = [
+            "萧炎和林动勾肩搭背地走进院子。",
+            "薰儿握住萧炎的手，没有松开。",
+            "萧炎挡在众人之前，催动异火。",
+            "旁人都说萧炎是个不好招惹的少年。",
+            "长老们在议事厅提起萧炎的婚约。",
+            "即使萧炎不在，昨日的决定仍让众人改变行程。",
+            "萧炎想起自己答应薰儿不再隐瞒。",
+        ]
+        .join("");
+        let evidences = [
+            "萧炎和林动勾肩搭背地走进院子",
+            "薰儿握住萧炎的手，没有松开",
+            "萧炎挡在众人之前，催动异火",
+            "旁人都说萧炎是个不好招惹的少年",
+            "长老们在议事厅提起萧炎的婚约",
+            "即使萧炎不在，昨日的决定仍让众人改变行程",
+            "萧炎想起自己答应薰儿不再隐瞒",
+        ];
+        let presence = [
+            "direct",
+            "direct",
+            "direct",
+            "mentioned",
+            "mentioned",
+            "consequence",
+            "direct",
+        ];
+        let candidates = evidences
+            .iter()
+            .zip(presence)
+            .enumerate()
+            .map(|(index, (evidence, presence_kind))| {
+                serde_json::json!({
+                    "chapter_index": 1,
+                    "presence_kind": presence_kind,
+                    "participants": ["萧炎"],
+                    "source_evidence": evidence,
+                    "narrative_function": format!("场景功能-{index}"),
+                    "thread_keys": [format!("关系线-{index}")],
+                    "confidence": 0.95
+                })
+            })
+            .collect::<Vec<_>>();
+        let analysis = serde_json::json!({"protagonist_impact_nodes": candidates}).to_string();
+        let nodes = parse_impact_nodes_from_analysis(&analysis, std::slice::from_ref(&chapter))
+            .expect("scenario nodes");
+        assert_eq!(nodes.len(), 7);
+        assert!(parse_impact_nodes_from_analysis(
+            r#"{"protagonist_impact_nodes":[]}"#,
+            std::slice::from_ref(&chapter)
+        )
+        .unwrap()
+        .is_empty());
+
+        let categories = [
+            "interaction_boundary",
+            "relationship_tension",
+            "power_rationale",
+            "social_reputation",
+            "other_reaction",
+            "action_expression",
+            "continuity_callback",
+        ];
+        let changes = [
+            "重写与男性同伴的互动边界和身体距离",
+            "让既有女性关系的张力在握手反应中自然显现",
+            "保持异火能力并调整保护动作表达与能力逻辑",
+            "让旁人评价形成新的社会名声反应",
+            "让婚约议论体现他人反应而不改变关系性质",
+            "让主角缺席后果通过众人的行动表达出来",
+            "回收对薰儿的承诺并形成连续性呼应",
+        ];
+        let obligations = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| RewriteObligation {
+                obligation_id: format!("O-{index}"),
+                node_id: node.node_id.clone(),
+                chapter_index: 1,
+                rule_ids: vec!["R3_PROTAGONIST_NODE_DELTA".to_string()],
+                preserve: vec![node.narrative_function.clone()],
+                required_changes: vec![changes[index].to_string()],
+                deep_delta_categories: vec![categories[index].to_string()],
+                forbidden_regressions: Vec::new(),
+                downstream_effects: Vec::new(),
+                planned_state_updates: if index == 6 {
+                    vec![RewriteStateUpdate {
+                        thread_key: "主角-薰儿承诺".to_string(),
+                        state_type: "承诺".to_string(),
+                        value: "不再隐瞒".to_string(),
+                        chapter_index: 1,
+                        source_obligation_ids: vec!["O-6".to_string()],
+                    }]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect::<Vec<_>>();
+        let plan = RewritePlan {
+            plan_version: "protagonist-graph-v1".to_string(),
+            graph_additions: Vec::new(),
+            obligations,
+            planned_state_updates: Vec::new(),
+            cross_shard_dependencies: Vec::new(),
+        };
+        let parsed_plan = parse_and_validate_rewrite_plan(
+            &serde_json::to_string(&plan).unwrap(),
+            std::slice::from_ref(&chapter),
+            &nodes,
+        )
+        .expect("scenario contract");
+        let rewrite = ParsedChapterRewrite {
+            id: chapter.id.clone(),
+            index: 1,
+            title: chapter.title.clone(),
+            text: (0..7)
+                .map(|index| format!("完成义务证据-{index}"))
+                .collect::<Vec<_>>()
+                .join("；"),
+        };
+        let coverage = (0..7)
+            .map(|index| ReviewCoverageItem {
+                obligation_id: format!("O-{index}"),
+                status: "satisfied".to_string(),
+                chapter_indexes: vec![1],
+                evidence: format!("完成义务证据-{index}"),
+            })
+            .collect::<Vec<_>>();
+
+        assert!(coverage.iter().all(
+            |item| crate::services::coverage::evidence_exists_in_rewrite(
+                item,
+                std::slice::from_ref(&rewrite)
+            )
+        ));
+        assert!(crate::services::coverage::coverage_gate_passes(
+            &parsed_plan,
+            &coverage,
+            &[],
+        ));
+        assert!(crate::services::coverage::validate_state_updates(
+            &parsed_plan,
+            &parsed_plan.obligations[6].planned_state_updates,
+        )
+        .is_empty());
     }
 }

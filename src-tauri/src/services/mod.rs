@@ -1,5 +1,7 @@
 pub(crate) mod analysis;
 pub(crate) mod coverage;
+pub(crate) mod contracts;
+pub(crate) mod dependency;
 pub(crate) mod estimation;
 pub(crate) mod planning;
 pub(crate) mod progress;

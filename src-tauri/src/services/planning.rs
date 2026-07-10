@@ -132,7 +132,8 @@ pub(crate) async fn plan_rewrite_shard(
         context.chapters,
         context.settings,
         context.style_prompt,
-        &relevant_continuity,
+        &continuity_json,
+        context.accumulated_state,
         &graph,
         &plan,
         context.run_id,
@@ -149,7 +150,8 @@ fn persist_plan_and_graph(
     chapters: &[Chapter],
     settings: &NovelSettings,
     style_prompt: &str,
-    relevant_continuity_json: &str,
+    stored_continuity_json: &str,
+    accumulated_state: &[RewriteStateUpdate],
     graph: &[crate::domain::SourceImpactNode],
     plan: &RewritePlan,
     run_id: &str,
@@ -159,11 +161,17 @@ fn persist_plan_and_graph(
     let graph_json = serialize_impact_graph(&merged_graph)?;
     let relevant_graph = impact_nodes_for_chapters(&merged_graph, chapters);
     let relevant_graph_json = serialize_impact_graph(&relevant_graph)?;
+    let relevant_continuity_json = project_relevant_continuity(
+        stored_continuity_json,
+        &relevant_graph,
+        None,
+        accumulated_state,
+    );
     let contract_json = format_rewrite_contract(plan);
     let fingerprint = plan_fingerprint(
         chapters,
         &relevant_graph_json,
-        relevant_continuity_json,
+        &relevant_continuity_json,
         settings,
         style_prompt,
         profile,
@@ -214,7 +222,7 @@ fn persist_plan_and_graph(
     tx.commit().map_err(to_string)
 }
 
-fn plan_fingerprint(
+pub(crate) fn plan_fingerprint(
     chapters: &[Chapter],
     graph_json: &str,
     continuity_json: &str,
@@ -252,4 +260,139 @@ fn plan_fingerprint(
         PROTAGONIST_RULE_PACK_VERSION, profile.id, profile.model
     );
     format!("{:x}", Sha256::digest(payload.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chapter() -> Chapter {
+        Chapter {
+            id: "chapter-1".to_string(),
+            novel_id: "novel-1".to_string(),
+            index: 1,
+            title: "第一章".to_string(),
+            original_text: "原文".to_string(),
+            analysis_json: None,
+            rewrite_text: None,
+            rewrite_edited: false,
+            single_rewrite_original_available: false,
+            analysis_status: "completed".to_string(),
+            rewrite_status: "pending".to_string(),
+            rewrite_validation_status: "unvalidated".to_string(),
+            rewrite_obligation_total: 0,
+            rewrite_obligation_satisfied: 0,
+        }
+    }
+
+    fn settings() -> NovelSettings {
+        NovelSettings {
+            novel_id: "novel-1".to_string(),
+            protagonist_name: "萧炎".to_string(),
+            protagonist_aliases: String::new(),
+            rewritten_protagonist_name: "萧妍".to_string(),
+            additional_feminize_names: String::new(),
+            bust: "普通".to_string(),
+            body_type: "少女".to_string(),
+            rewrite_mode: "strict".to_string(),
+            advanced_settings: String::new(),
+            relationship_targets: "[]".to_string(),
+            updated_at: "now".to_string(),
+        }
+    }
+
+    fn profile() -> ModelProfile {
+        ModelProfile {
+            id: "profile-1".to_string(),
+            name: "模型".to_string(),
+            provider: "openai".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            model: "model-a".to_string(),
+            temperature: 0.7,
+            top_p: 1.0,
+            thinking_mode: "off".to_string(),
+            prompt_obfuscation_enabled: false,
+            has_api_key: false,
+            api_key_storage: "none".to_string(),
+            updated_at: "now".to_string(),
+        }
+    }
+
+    #[test]
+    fn fingerprint_changes_for_every_contract_input_class() {
+        let chapter = chapter();
+        let settings = settings();
+        let profile = profile();
+        let base = plan_fingerprint(
+            std::slice::from_ref(&chapter),
+            "graph-a",
+            "state-a",
+            &settings,
+            "style-a",
+            &profile,
+        );
+        let changed = [
+            plan_fingerprint(
+                std::slice::from_ref(&chapter),
+                "graph-b",
+                "state-a",
+                &settings,
+                "style-a",
+                &profile,
+            ),
+            plan_fingerprint(
+                std::slice::from_ref(&chapter),
+                "graph-a",
+                "state-b",
+                &settings,
+                "style-a",
+                &profile,
+            ),
+            plan_fingerprint(
+                std::slice::from_ref(&chapter),
+                "graph-a",
+                "state-a",
+                &settings,
+                "style-b",
+                &profile,
+            ),
+            {
+                let mut settings = settings.clone();
+                settings.body_type = "高挑".to_string();
+                plan_fingerprint(
+                    std::slice::from_ref(&chapter),
+                    "graph-a",
+                    "state-a",
+                    &settings,
+                    "style-a",
+                    &profile,
+                )
+            },
+            {
+                let mut profile = profile.clone();
+                profile.model = "model-b".to_string();
+                plan_fingerprint(
+                    std::slice::from_ref(&chapter),
+                    "graph-a",
+                    "state-a",
+                    &settings,
+                    "style-a",
+                    &profile,
+                )
+            },
+            {
+                let mut chapter = chapter.clone();
+                chapter.original_text = "变更原文".to_string();
+                plan_fingerprint(
+                    std::slice::from_ref(&chapter),
+                    "graph-a",
+                    "state-a",
+                    &settings,
+                    "style-a",
+                    &profile,
+                )
+            },
+        ];
+        assert!(changed.iter().all(|fingerprint| fingerprint != &base));
+    }
 }

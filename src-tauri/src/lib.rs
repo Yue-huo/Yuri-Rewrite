@@ -28,11 +28,15 @@ use rate_limit::RateLimitCoordinator;
 use regex::Regex;
 use repositories::{chapters::*, jobs::*, logs::*};
 use reqwest::Client;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
 use services::progress::*;
+use services::coverage::{
+    parse_rewrite_review_decision_output, persist_rewrite_review_result,
+};
+use services::repair::{build_repair_core_prompt, plan_review_revision, RevisionPlan};
 use services::{estimation::*, shard_context::*};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -1710,8 +1714,9 @@ async fn generate_single_rewrite_shard(
     let tagged_check = graph_strategy && rewrite_check_mode == REWRITE_CHECK_TAGGED;
     let prompt = if graph_strategy {
         let plan = rewrite_plan.ok_or_else(|| "主角主动重构缺少分片改写契约。".to_string())?;
-        let (nodes, continuity_json) =
-            load_relevant_graph_context(state, novel_id, shard, plan)?;
+        let (nodes, continuity_json) = services::contracts::load_relevant_graph_context(
+            state, novel_id, shard, plan,
+        )?;
         build_graph_rewrite_prompt_with_context(
             shard,
             &shard_canon_text,
@@ -1854,23 +1859,6 @@ async fn generate_single_rewrite_shard(
             Err(error)
         }
     }
-}
-
-fn load_relevant_graph_context(
-    state: &State<'_, AppState>,
-    novel_id: &str,
-    shard: &[Chapter],
-    plan: &RewritePlan,
-) -> Result<(Vec<SourceImpactNode>, String), String> {
-    let conn = state.conn.lock().map_err(to_string)?;
-    let graph = load_canon_asset_content(&conn, novel_id, IMPACT_GRAPH_ASSET_KIND)?
-        .map(|content| parse_impact_graph(&content))
-        .unwrap_or_default();
-    let nodes = impact_nodes_for_chapters(&graph, shard);
-    let continuity = load_canon_asset_content(&conn, novel_id, REWRITE_CONTINUITY_ASSET_KIND)?
-        .unwrap_or_else(|| "[]".to_string());
-    let continuity = project_relevant_continuity(&continuity, &nodes, Some(plan), &[]);
-    Ok((nodes, continuity))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2089,7 +2077,11 @@ async fn generate_reviewed_rewrite_pipeline(
         .map(|batch_index| load_staged_outputs(state, novel_id, batch_index, "rewrite_draft"))
         .transpose()?
         .unwrap_or_default();
-    let run_id = Uuid::new_v4().to_string();
+    let run_id = services::contracts::load_or_create_rewrite_run_id(
+        state,
+        novel_id,
+        checkpoint_batch_index,
+    )?;
     let mut accumulated_state = Vec::<RewriteStateUpdate>::new();
     let mut prior_contracts = Vec::<RewritePlan>::new();
     let mut prepared = Vec::with_capacity(shard_total);
@@ -2112,10 +2104,21 @@ async fn generate_reviewed_rewrite_pipeline(
         };
         let plan = if graph_strategy {
             report_auto_shard_started(state, novel_id, "planning", idx, shard_total, &shard)?;
-            let reusable_plan = if reusable_draft.is_some() {
-                load_reusable_rewrite_plan(state, &shard)?
-            } else {
-                None
+            let reusable_plan = match checkpoint_batch_index {
+                Some(batch_index) => services::contracts::load_reusable_rewrite_plan(
+                    state,
+                    services::contracts::ContractReuseContext {
+                        novel_id,
+                        chapters: &shard,
+                        batch_index,
+                        settings,
+                        style_prompt: core_prompt,
+                        profile: rewrite_profile,
+                        accumulated_state: &accumulated_state,
+                        expected_run_id: &run_id,
+                    },
+                )?,
+                None => None,
             };
             if reusable_draft.is_some() && reusable_plan.is_none() {
                 reusable_draft = None;
@@ -2151,21 +2154,36 @@ async fn generate_reviewed_rewrite_pipeline(
         } else {
             None
         };
-        let dependency_level = plan
-            .as_ref()
-            .filter(|plan| !plan.cross_shard_dependencies.is_empty())
-            .map_or(0, |_| idx + 1);
-        prepared.push((dependency_level, idx, shard, shard_label, readonly_context, context, plan, reusable_draft));
+        prepared.push((idx, shard, shard_label, readonly_context, context, plan, reusable_draft));
     }
 
+    let dependency_levels = if graph_strategy {
+        let plans = prepared
+            .iter()
+            .map(|item| {
+                item.5
+                    .clone()
+                    .ok_or_else(|| "主角主动重构分片缺少改写契约。".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let graph = {
+            let conn = state.conn.lock().map_err(to_string)?;
+            load_canon_asset_content(&conn, novel_id, IMPACT_GRAPH_ASSET_KIND)?
+                .map(|content| parse_impact_graph(&content))
+                .unwrap_or_default()
+        };
+        services::dependency::build_dependency_levels(&plans, &graph)?
+    } else {
+        vec![0; prepared.len()]
+    };
     let mut waves = BTreeMap::<usize, Vec<_>>::new();
-    for item in prepared {
-        waves.entry(item.0).or_default().push(item);
+    for (dependency_level, item) in dependency_levels.into_iter().zip(prepared) {
+        waves.entry(dependency_level).or_default().push(item);
     }
     let mut parsed_by_shard = Vec::new();
     for (_, wave) in waves {
         let tasks = stream::iter(wave.into_iter().map(
-            |(_, idx, shard, shard_label, readonly_context, context, plan, reusable_draft)| {
+            |(idx, shard, shard_label, readonly_context, context, plan, reusable_draft)| {
             async move {
                 report_auto_shard_started(state, novel_id, "rewrite", idx, shard_total, &shard)?;
                 let rewrite_shard = if let Some(draft) = reusable_draft {
@@ -2277,7 +2295,9 @@ async fn review_rewrite_shard_strict(
     tagged_check: bool,
 ) -> Result<Vec<ParsedChapterRewrite>, String> {
     let repair_continuity = rewrite_plan
-        .map(|plan| load_relevant_graph_context(state, novel_id, shard, plan))
+        .map(|plan| {
+            services::contracts::load_relevant_graph_context(state, novel_id, shard, plan)
+        })
         .transpose()?
         .map(|(_, continuity)| continuity)
         .unwrap_or_else(|| "[]".to_string());
@@ -2456,29 +2476,6 @@ async fn review_rewrite_shard_strict(
     Ok(second_revised)
 }
 
-fn build_repair_core_prompt(
-    shard: &[Chapter],
-    style_prompt: &str,
-    rewrite_plan: Option<&RewritePlan>,
-    decision: &ReviewDecision,
-    continuity_json: &str,
-) -> String {
-    let Some(plan) = rewrite_plan else {
-        return style_prompt.to_string();
-    };
-    let target_indexes = match plan_review_revision(shard, decision) {
-        RevisionPlan::Targeted(indexes) => Some(indexes.into_iter().collect::<HashSet<_>>()),
-        RevisionPlan::Full(_) => None,
-    };
-    format!(
-        "{}\n\n【本次修复所需契约】\n{}\n\n【相关已通过连续性状态】\n{}\n\n【低优先级全局文风补充】\n{}",
-        protagonist_rule_pack(),
-        format_execution_contract(plan, target_indexes.as_ref()),
-        prompt_context_or_none(continuity_json),
-        prompt_context_or_none(style_prompt)
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn review_shard_decision(
     state: &State<'_, AppState>,
@@ -2497,7 +2494,9 @@ async fn review_shard_decision(
     rewrite_plan: Option<&RewritePlan>,
 ) -> Result<ReviewDecision, String> {
     let prompt = if let Some(plan) = rewrite_plan {
-        let (_, continuity_json) = load_relevant_graph_context(state, novel_id, shard, plan)?;
+        let (_, continuity_json) = services::contracts::load_relevant_graph_context(
+            state, novel_id, shard, plan,
+        )?;
         build_graph_review_decision_prompt(
             shard,
             rewrites,
@@ -2768,91 +2767,6 @@ fn validate_review_model_output(
         )?;
     }
     Ok(decision)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn persist_rewrite_review_result(
-    state: &State<'_, AppState>,
-    novel_id: &str,
-    shard: &[Chapter],
-    plan: &RewritePlan,
-    decision: &ReviewDecision,
-    coverage: &[ReviewCoverageItem],
-    state_updates: &[RewriteStateUpdate],
-) -> Result<(), String> {
-    let now = Utc::now().to_rfc3339();
-    let coverage_json = serde_json::to_string_pretty(&serde_json::json!({
-        "approved": decision.approved,
-        "coverage": coverage,
-        "state_updates": state_updates,
-    }))
-    .map_err(to_string)?;
-    let obligations = plan
-        .obligations
-        .iter()
-        .map(|obligation| (obligation.obligation_id.as_str(), obligation.chapter_index))
-        .collect::<HashMap<_, _>>();
-    let mut conn = state.conn.lock().map_err(to_string)?;
-    let tx = conn.transaction().map_err(to_string)?;
-    for chapter in shard {
-        let satisfied = coverage
-            .iter()
-            .filter(|item| {
-                item.status == "satisfied"
-                    && obligations
-                        .get(item.obligation_id.as_str())
-                        .is_some_and(|chapter_index| *chapter_index == chapter.index)
-            })
-            .count();
-        tx.execute(
-            "UPDATE rewrite_contracts
-             SET coverage_json = ?1, validation_status = ?2,
-                 obligation_satisfied = ?3, updated_at = ?4
-             WHERE chapter_id = ?5",
-            params![
-                coverage_json,
-                if decision.approved { "passed" } else { "failed" },
-                satisfied,
-                now,
-                chapter.id
-            ],
-        )
-        .map_err(to_string)?;
-    }
-    if decision.approved {
-        let existing = load_canon_asset_content(
-            &tx,
-            novel_id,
-            REWRITE_CONTINUITY_ASSET_KIND,
-        )?
-        .and_then(|content| serde_json::from_str::<Vec<RewriteStateUpdate>>(&content).ok())
-        .unwrap_or_default();
-        let mut merged = existing
-            .into_iter()
-            .map(|item| ((item.thread_key.clone(), item.state_type.clone()), item))
-            .collect::<HashMap<_, _>>();
-        for update in state_updates {
-            let key = (update.thread_key.clone(), update.state_type.clone());
-            let should_replace = merged
-                .get(&key)
-                .is_none_or(|current| update.chapter_index >= current.chapter_index);
-            if should_replace {
-                merged.insert(key, update.clone());
-            }
-        }
-        let mut states = merged.into_values().collect::<Vec<_>>();
-        states.sort_by_key(|state| (state.chapter_index, state.thread_key.clone(), state.state_type.clone()));
-        let content = serde_json::to_string_pretty(&states).map_err(to_string)?;
-        upsert_canon_asset(
-            &tx,
-            novel_id,
-            REWRITE_CONTINUITY_ASSET_KIND,
-            &content,
-            &now,
-        )
-        .map_err(to_string)?;
-    }
-    tx.commit().map_err(to_string)
 }
 
 fn review_decision_parse_error_message(shard_label: &str, error: &str) -> String {
@@ -4227,7 +4141,7 @@ fn is_non_actionable_review_issue(
     explicitly_compliant && !has_actual_defect
 }
 
-fn parse_review_decision_output(
+pub(crate) fn parse_review_decision_output(
     output: &str,
     settings: &NovelSettings,
 ) -> Result<ReviewDecision, String> {
@@ -4357,250 +4271,6 @@ fn parse_review_decision_output(
     }
     let approved = issues.is_empty();
     Ok(ReviewDecision { approved, issues })
-}
-
-fn parse_rewrite_review_decision_output(
-    output: &str,
-    settings: &NovelSettings,
-    plan: &RewritePlan,
-    rewrites: &[ParsedChapterRewrite],
-) -> Result<RewriteReviewDecision, String> {
-    let mut decision = parse_review_decision_output(output, settings)?;
-    let value = parse_jsonish_value(output)?;
-    let coverage = value
-        .get("coverage")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(serde_json::from_value::<ReviewCoverageItem>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("coverage 字段无效：{error}"))?;
-    let state_updates = value
-        .get("state_updates")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(serde_json::from_value::<RewriteStateUpdate>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("state_updates 字段无效：{error}"))?;
-
-    let expected = plan
-        .obligations
-        .iter()
-        .map(|obligation| (obligation.obligation_id.as_str(), obligation))
-        .collect::<HashMap<_, _>>();
-    let mut seen = HashSet::new();
-    for item in &coverage {
-        let Some(obligation) = expected.get(item.obligation_id.as_str()) else {
-            decision.issues.push(ReviewIssue {
-                chapter_indexes: item.chapter_indexes.clone(),
-                scope: "chapter".to_string(),
-                category: "obligation_coverage".to_string(),
-                severity: "blocking".to_string(),
-                problem: format!("coverage 引用了未知义务 {}。", item.obligation_id),
-                required_fix: "仅按当前契约逐项重新验收。".to_string(),
-            });
-            continue;
-        };
-        if !seen.insert(item.obligation_id.clone()) {
-            decision.issues.push(ReviewIssue {
-                chapter_indexes: vec![obligation.chapter_index],
-                scope: "chapter".to_string(),
-                category: "obligation_coverage".to_string(),
-                severity: "blocking".to_string(),
-                problem: format!("义务 {} 在 coverage 中重复出现。", item.obligation_id),
-                required_fix: "每个义务只能输出一个 coverage 项。".to_string(),
-            });
-        }
-        if !matches!(item.status.as_str(), "satisfied" | "partial" | "missed" | "regressed") {
-            return Err(format!(
-                "义务 {} 使用了未知 coverage 状态：{}",
-                item.obligation_id, item.status
-            ));
-        }
-        let evidence_exists = services::coverage::evidence_exists_in_rewrite(item, rewrites);
-        if item.status != "satisfied" || !evidence_exists {
-            decision.issues.push(ReviewIssue {
-                chapter_indexes: vec![obligation.chapter_index],
-                scope: "chapter".to_string(),
-                category: "obligation_coverage".to_string(),
-                severity: "blocking".to_string(),
-                problem: if item.status == "satisfied" {
-                    format!(
-                        "义务 {} 的 satisfied 证据无法在当前改写稿中定位。",
-                        item.obligation_id
-                    )
-                } else {
-                    format!("义务 {} 状态为 {}。", item.obligation_id, item.status)
-                },
-                required_fix: format!(
-                    "定向完成义务 {}：{}",
-                    item.obligation_id,
-                    obligation.required_changes.join("；")
-                ),
-            });
-        }
-    }
-    for obligation in &plan.obligations {
-        if !seen.contains(&obligation.obligation_id) {
-            decision.issues.push(ReviewIssue {
-                chapter_indexes: vec![obligation.chapter_index],
-                scope: "chapter".to_string(),
-                category: "obligation_coverage".to_string(),
-                severity: "blocking".to_string(),
-                problem: format!("coverage 遗漏义务 {}。", obligation.obligation_id),
-                required_fix: format!(
-                    "验收并完成：{}",
-                    obligation.required_changes.join("；")
-                ),
-            });
-        }
-    }
-
-    let expected_states = plan
-        .planned_state_updates
-        .iter()
-        .chain(
-            plan.obligations
-                .iter()
-                .flat_map(|obligation| obligation.planned_state_updates.iter()),
-        )
-        .collect::<Vec<_>>();
-    for expected_state in &expected_states {
-        if !state_updates.iter().any(|actual| {
-            actual.thread_key == expected_state.thread_key
-                && actual.state_type == expected_state.state_type
-                && actual.value == expected_state.value
-        }) {
-            decision.issues.push(ReviewIssue {
-                chapter_indexes: vec![expected_state.chapter_index],
-                scope: "cross_chapter".to_string(),
-                category: "continuity".to_string(),
-                severity: "blocking".to_string(),
-                problem: format!(
-                    "复检状态未确认计划状态 {} / {}。",
-                    expected_state.thread_key, expected_state.state_type
-                ),
-                required_fix: "修复正文后返回与契约一致的 state_updates。".to_string(),
-            });
-        }
-    }
-    for actual in &state_updates {
-        if !expected_states.iter().any(|expected| {
-            actual.thread_key == expected.thread_key
-                && actual.state_type == expected.state_type
-                && actual.value == expected.value
-        }) {
-            decision.issues.push(ReviewIssue {
-                chapter_indexes: vec![actual.chapter_index],
-                scope: "cross_chapter".to_string(),
-                category: "continuity".to_string(),
-                severity: "blocking".to_string(),
-                problem: format!(
-                    "复检返回了契约未计划的状态 {} / {}。",
-                    actual.thread_key, actual.state_type
-                ),
-                required_fix: "删除未计划状态，或重新规划后再生成正文。".to_string(),
-            });
-        }
-    }
-    decision.approved =
-        services::coverage::coverage_gate_passes(plan, &coverage, &decision.issues);
-    Ok(RewriteReviewDecision {
-        decision,
-        coverage,
-        state_updates,
-    })
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum RevisionPlan {
-    Targeted(Vec<i64>),
-    Full(String),
-}
-
-fn plan_review_revision(shard: &[Chapter], decision: &ReviewDecision) -> RevisionPlan {
-    let shard_indexes = shard
-        .iter()
-        .map(|chapter| chapter.index)
-        .collect::<HashSet<_>>();
-    let mut target_indexes = HashSet::new();
-    for issue in &decision.issues {
-        let issue_text = format!("{} {}", issue.problem, issue.required_fix);
-        let category = issue.category.to_ascii_lowercase();
-        let scope = issue.scope.to_ascii_lowercase();
-        let crosses_chapters = scope != "chapter"
-            || contains_any(
-                &category,
-                &[
-                    "cross",
-                    "boundary",
-                    "continuity",
-                    "missing",
-                    "duplicate",
-                    "order",
-                ],
-            )
-            || contains_any(
-                &issue_text,
-                &[
-                    "跨章",
-                    "连续性",
-                    "章节边界",
-                    "章节缺失",
-                    "缺少章节",
-                    "章节重复",
-                    "重复章节",
-                    "串章",
-                    "额外章节",
-                    "章节顺序",
-                    "空正文",
-                ],
-            );
-        if crosses_chapters {
-            return RevisionPlan::Full(format!(
-                "问题涉及跨章一致性或章节结构：{}",
-                review_issue_text(issue)
-            ));
-        }
-        if issue.chapter_indexes.is_empty() {
-            return RevisionPlan::Full(format!(
-                "审查问题未提供可定位的分片索引：{}",
-                review_issue_text(issue)
-            ));
-        }
-        if issue
-            .chapter_indexes
-            .iter()
-            .any(|index| !shard_indexes.contains(index))
-        {
-            return RevisionPlan::Full(format!(
-                "审查问题包含当前分片之外的索引：{}",
-                review_issue_text(issue)
-            ));
-        }
-        target_indexes.extend(issue.chapter_indexes.iter().copied());
-    }
-
-    if target_indexes.is_empty() {
-        return RevisionPlan::Full("审查未提供可执行的目标章节。".to_string());
-    }
-    if target_indexes.len() * 2 > shard.len() {
-        return RevisionPlan::Full(format!(
-            "目标章节 {} 个，超过当前分片 {} 章的一半。",
-            target_indexes.len(),
-            shard.len()
-        ));
-    }
-    let mut ordered = shard
-        .iter()
-        .filter(|chapter| target_indexes.contains(&chapter.index))
-        .map(|chapter| chapter.index)
-        .collect::<Vec<_>>();
-    ordered.dedup();
-    RevisionPlan::Targeted(ordered)
 }
 
 fn build_targeted_revision_context(
@@ -6059,48 +5729,6 @@ fn staged_draft_for_shard(
         })
 }
 
-fn load_reusable_rewrite_plan(
-    state: &State<'_, AppState>,
-    shard: &[Chapter],
-) -> Result<Option<RewritePlan>, String> {
-    let conn = state.conn.lock().map_err(to_string)?;
-    let mut contract_json: Option<String> = None;
-    for chapter in shard {
-        let record = conn
-            .query_row(
-                "SELECT contract_json, validation_status, rule_pack_version FROM rewrite_contracts WHERE chapter_id = ?1",
-                params![chapter.id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(to_string)?;
-        let Some((candidate, status, rule_pack_version)) = record else {
-            return Ok(None);
-        };
-        if !matches!(status.as_str(), "planned" | "failed")
-            || rule_pack_version != PROTAGONIST_RULE_PACK_VERSION
-        {
-            return Ok(None);
-        }
-        if contract_json
-            .as_ref()
-            .is_some_and(|existing| existing != &candidate)
-        {
-            return Ok(None);
-        }
-        contract_json = Some(candidate);
-    }
-    contract_json
-        .map(|json| serde_json::from_str::<RewritePlan>(&json).map_err(to_string))
-        .transpose()
-}
-
 fn stage_rewrite_draft_shard(
     state: &State<'_, AppState>,
     novel_id: &str,
@@ -6716,6 +6344,13 @@ fn persist_auto_run_checkpoint(
             END,
             phase = COALESCE(excluded.phase, auto_run_checkpoints.phase),
             batch_index = COALESCE(excluded.batch_index, auto_run_checkpoints.batch_index),
+            rewrite_run_id = CASE
+                WHEN excluded.job_id IS NOT auto_run_checkpoints.job_id THEN NULL
+                WHEN excluded.batch_index IS NOT NULL
+                     AND auto_run_checkpoints.batch_index IS NOT NULL
+                     AND excluded.batch_index != auto_run_checkpoints.batch_index THEN NULL
+                ELSE auto_run_checkpoints.rewrite_run_id
+            END,
             profile_ids = excluded.profile_ids,
             updated_at = excluded.updated_at
         "#,
@@ -8015,6 +7650,16 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.category == "obligation_coverage"));
+
+        let wrong_chapter = valid.replace("\"chapter_indexes\":[1]", "\"chapter_indexes\":[2]");
+        let parsed = parse_rewrite_review_decision_output(
+            &wrong_chapter,
+            &sample_novel_settings(),
+            &sample_rewrite_plan(),
+            &rewrites,
+        )
+        .unwrap();
+        assert!(!parsed.decision.approved);
     }
 
     #[test]
