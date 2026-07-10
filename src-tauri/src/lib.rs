@@ -1710,20 +1710,8 @@ async fn generate_single_rewrite_shard(
     let tagged_check = graph_strategy && rewrite_check_mode == REWRITE_CHECK_TAGGED;
     let prompt = if graph_strategy {
         let plan = rewrite_plan.ok_or_else(|| "主角主动重构缺少分片改写契约。".to_string())?;
-        let (nodes, continuity_json) = {
-            let conn = state.conn.lock().map_err(to_string)?;
-            let graph = load_canon_asset_content(&conn, novel_id, IMPACT_GRAPH_ASSET_KIND)?
-                .map(|content| parse_impact_graph(&content))
-                .unwrap_or_default();
-            let nodes = impact_nodes_for_chapters(&graph, shard);
-            let continuity = load_canon_asset_content(
-                &conn,
-                novel_id,
-                REWRITE_CONTINUITY_ASSET_KIND,
-            )?
-            .unwrap_or_else(|| "[]".to_string());
-            (nodes, continuity)
-        };
+        let (nodes, continuity_json) =
+            load_relevant_graph_context(state, novel_id, shard, plan)?;
         build_graph_rewrite_prompt_with_context(
             shard,
             &shard_canon_text,
@@ -1866,6 +1854,23 @@ async fn generate_single_rewrite_shard(
             Err(error)
         }
     }
+}
+
+fn load_relevant_graph_context(
+    state: &State<'_, AppState>,
+    novel_id: &str,
+    shard: &[Chapter],
+    plan: &RewritePlan,
+) -> Result<(Vec<SourceImpactNode>, String), String> {
+    let conn = state.conn.lock().map_err(to_string)?;
+    let graph = load_canon_asset_content(&conn, novel_id, IMPACT_GRAPH_ASSET_KIND)?
+        .map(|content| parse_impact_graph(&content))
+        .unwrap_or_default();
+    let nodes = impact_nodes_for_chapters(&graph, shard);
+    let continuity = load_canon_asset_content(&conn, novel_id, REWRITE_CONTINUITY_ASSET_KIND)?
+        .unwrap_or_else(|| "[]".to_string());
+    let continuity = project_relevant_continuity(&continuity, &nodes, Some(plan), &[]);
+    Ok((nodes, continuity))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2271,17 +2276,11 @@ async fn review_rewrite_shard_strict(
     rewrite_plan: Option<&RewritePlan>,
     tagged_check: bool,
 ) -> Result<Vec<ParsedChapterRewrite>, String> {
-    let repair_core_prompt = rewrite_plan.map_or_else(
-        || core_prompt.to_string(),
-        |plan| {
-            format!(
-                "{}\n\n【当前分片强制改写契约】\n{}\n\n【低优先级全局文风补充】\n{}",
-                protagonist_rule_pack(),
-                format_rewrite_contract(plan),
-                prompt_context_or_none(core_prompt)
-            )
-        },
-    );
+    let repair_continuity = rewrite_plan
+        .map(|plan| load_relevant_graph_context(state, novel_id, shard, plan))
+        .transpose()?
+        .map(|(_, continuity)| continuity)
+        .unwrap_or_else(|| "[]".to_string());
     let first_decision = review_shard_decision(
         state,
         novel_id,
@@ -2314,6 +2313,13 @@ async fn review_rewrite_shard_strict(
         None,
         None,
     )?;
+    let repair_core_prompt = build_repair_core_prompt(
+        shard,
+        core_prompt,
+        rewrite_plan,
+        &first_decision,
+        &repair_continuity,
+    );
     let revised = services::repair::repair_reviewed_shard(
         state,
         services::repair::ReviewRepairContext {
@@ -2364,6 +2370,13 @@ async fn review_rewrite_shard_strict(
         None,
         None,
     )?;
+    let repair_core_prompt = build_repair_core_prompt(
+        shard,
+        core_prompt,
+        rewrite_plan,
+        &second_decision,
+        &repair_continuity,
+    );
     let second_revised = services::repair::repair_reviewed_shard(
         state,
         services::repair::ReviewRepairContext {
@@ -2443,6 +2456,29 @@ async fn review_rewrite_shard_strict(
     Ok(second_revised)
 }
 
+fn build_repair_core_prompt(
+    shard: &[Chapter],
+    style_prompt: &str,
+    rewrite_plan: Option<&RewritePlan>,
+    decision: &ReviewDecision,
+    continuity_json: &str,
+) -> String {
+    let Some(plan) = rewrite_plan else {
+        return style_prompt.to_string();
+    };
+    let target_indexes = match plan_review_revision(shard, decision) {
+        RevisionPlan::Targeted(indexes) => Some(indexes.into_iter().collect::<HashSet<_>>()),
+        RevisionPlan::Full(_) => None,
+    };
+    format!(
+        "{}\n\n【本次修复所需契约】\n{}\n\n【相关已通过连续性状态】\n{}\n\n【低优先级全局文风补充】\n{}",
+        protagonist_rule_pack(),
+        format_execution_contract(plan, target_indexes.as_ref()),
+        prompt_context_or_none(continuity_json),
+        prompt_context_or_none(style_prompt)
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn review_shard_decision(
     state: &State<'_, AppState>,
@@ -2461,6 +2497,7 @@ async fn review_shard_decision(
     rewrite_plan: Option<&RewritePlan>,
 ) -> Result<ReviewDecision, String> {
     let prompt = if let Some(plan) = rewrite_plan {
+        let (_, continuity_json) = load_relevant_graph_context(state, novel_id, shard, plan)?;
         build_graph_review_decision_prompt(
             shard,
             rewrites,
@@ -2469,6 +2506,7 @@ async fn review_shard_decision(
             canon_text,
             shard_context,
             plan,
+            &continuity_json,
         )
     } else {
         build_batch_review_decision_prompt_with_context(
@@ -5184,8 +5222,9 @@ fn build_graph_review_decision_prompt(
     canon_text: &str,
     shard_context: &str,
     plan: &RewritePlan,
+    continuity_json: &str,
 ) -> String {
-    let contract = format_rewrite_contract(plan);
+    let contract = format_execution_contract(plan, None);
     let constraints = build_compact_review_constraints(settings, style_prompt, canon_text);
     format!(
         r#"你是主角主动重构质量门。只输出一个合法 JSON 对象，不输出 Markdown 或解释。
@@ -5234,6 +5273,9 @@ fn build_graph_review_decision_prompt(
 当前分片契约：
 {contract}
 
+当前关系线的已通过连续性状态：
+{continuity}
+
 处理范围：
 {shard_context}
 
@@ -5245,6 +5287,7 @@ fn build_graph_review_decision_prompt(
         rule_pack = protagonist_rule_pack(),
         constraints = constraints,
         contract = contract,
+        continuity = prompt_context_or_none(continuity_json),
         shard_context = prompt_context_or_none(shard_context),
         original = build_batch_chapter_text(chapters, false),
         rewrite = build_batch_rewrite_text(chapters, rewrites),

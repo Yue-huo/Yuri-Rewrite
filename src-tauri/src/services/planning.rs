@@ -4,9 +4,9 @@ use crate::domain::{
 use crate::{
     append_ai_log, build_rewrite_plan_prompt, format_model_log_content, format_rewrite_contract,
     generate_text, impact_nodes_for_chapters, load_canon_asset_content, merge_impact_graph_nodes,
-    parse_and_validate_rewrite_plan, parse_impact_graph, serialize_impact_graph, to_string,
-    upsert_canon_asset, IMPACT_GRAPH_ASSET_KIND, PROTAGONIST_RULE_PACK_VERSION,
-    REWRITE_CONTINUITY_ASSET_KIND,
+    parse_and_validate_rewrite_plan, parse_impact_graph, project_relevant_continuity,
+    serialize_impact_graph, to_string, upsert_canon_asset, IMPACT_GRAPH_ASSET_KIND,
+    PROTAGONIST_RULE_PACK_VERSION, REWRITE_CONTINUITY_ASSET_KIND,
 };
 use chrono::Utc;
 use rusqlite::params;
@@ -45,13 +45,19 @@ pub(crate) async fn plan_rewrite_shard(
     };
     let graph = parse_impact_graph(&graph_content);
     let base_nodes = impact_nodes_for_chapters(&graph, context.chapters);
+    let relevant_continuity = project_relevant_continuity(
+        &continuity_json,
+        &base_nodes,
+        None,
+        context.accumulated_state,
+    );
     let prompt = build_rewrite_plan_prompt(
         context.chapters,
         &base_nodes,
-        &continuity_json,
+        &graph,
+        &relevant_continuity,
         context.settings,
         context.style_prompt,
-        context.accumulated_state,
         context.prior_contracts,
     );
     let output = generate_text(
@@ -126,7 +132,7 @@ pub(crate) async fn plan_rewrite_shard(
         context.chapters,
         context.settings,
         context.style_prompt,
-        &continuity_json,
+        &relevant_continuity,
         &graph,
         &plan,
         context.run_id,
@@ -143,7 +149,7 @@ fn persist_plan_and_graph(
     chapters: &[Chapter],
     settings: &NovelSettings,
     style_prompt: &str,
-    continuity_json: &str,
+    relevant_continuity_json: &str,
     graph: &[crate::domain::SourceImpactNode],
     plan: &RewritePlan,
     run_id: &str,
@@ -151,11 +157,13 @@ fn persist_plan_and_graph(
 ) -> Result<(), String> {
     let merged_graph = merge_impact_graph_nodes(graph, &plan.graph_additions);
     let graph_json = serialize_impact_graph(&merged_graph)?;
+    let relevant_graph = impact_nodes_for_chapters(&merged_graph, chapters);
+    let relevant_graph_json = serialize_impact_graph(&relevant_graph)?;
     let contract_json = format_rewrite_contract(plan);
     let fingerprint = plan_fingerprint(
         chapters,
-        &graph_json,
-        continuity_json,
+        &relevant_graph_json,
+        relevant_continuity_json,
         settings,
         style_prompt,
         profile,

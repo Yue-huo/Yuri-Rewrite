@@ -2,7 +2,8 @@ use crate::domain::{
     CanonAsset, Chapter, NovelSettings, ParsedChapterRewrite, RewritePlan, SourceImpactNode,
 };
 use crate::{
-    additional_feminize_name_sources, protagonist_rule_pack, relationship_targets_summary,
+    additional_feminize_name_sources, format_execution_contract, format_execution_nodes,
+    is_managed_graph_asset_kind, protagonist_rule_pack, relationship_targets_summary,
     truncate_text,
 };
 use std::collections::HashSet;
@@ -95,6 +96,7 @@ pub(crate) fn build_compact_canon_text(assets: &[CanonAsset]) -> String {
 
     let compacted = sorted_canon_assets(assets)
         .into_iter()
+        .filter(|asset| !is_managed_graph_asset_kind(&asset.kind))
         .filter_map(|asset| {
             let content = compact_canon_asset_content(&asset.kind, &asset.content);
             if content.trim().is_empty() {
@@ -130,6 +132,7 @@ pub(crate) fn build_relevant_canon_text(
 
     let selected = sorted_canon_assets(assets)
         .into_iter()
+        .filter(|asset| !is_managed_graph_asset_kind(&asset.kind))
         .filter_map(|asset| {
             let content = select_relevant_canon_content(asset, &keywords, settings);
             if content.trim().is_empty() {
@@ -853,8 +856,8 @@ pub(crate) fn build_graph_rewrite_prompt_with_context(
     continuity_json: &str,
     tagged_check: bool,
 ) -> String {
-    let contract_json = serde_json::to_string_pretty(plan).unwrap_or_else(|_| "{}".to_string());
-    let nodes_json = serde_json::to_string_pretty(nodes).unwrap_or_else(|_| "[]".to_string());
+    let contract_json = format_execution_contract(plan, None);
+    let nodes_json = format_execution_nodes(nodes);
     let current_draft = if chapters.iter().any(|chapter| {
         chapter
             .rewrite_text

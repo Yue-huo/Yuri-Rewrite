@@ -1,8 +1,10 @@
 use crate::domain::{
-    Chapter, NovelSettings, RewriteObligation, RewritePlan, RewriteStateUpdate, SourceImpactLink,
-    SourceImpactNode,
+    Chapter, NovelSettings, RewriteObligation, RewritePlan, SourceImpactLink, SourceImpactNode,
 };
-use crate::{parse_jsonish_value, protagonist_rule_pack, DEEP_DELTA_CATEGORIES};
+use crate::{
+    format_planning_nodes, format_prior_contract_context, parse_jsonish_value,
+    protagonist_rule_pack, DEEP_DELTA_CATEGORIES,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -221,17 +223,15 @@ pub(crate) fn impact_nodes_for_chapters(
 pub(crate) fn build_rewrite_plan_prompt(
     chapters: &[Chapter],
     nodes: &[SourceImpactNode],
+    dependency_graph: &[SourceImpactNode],
     continuity_json: &str,
     settings: &NovelSettings,
     style_prompt: &str,
-    accumulated_state: &[RewriteStateUpdate],
     prior_contracts: &[RewritePlan],
 ) -> String {
-    let nodes_json = serde_json::to_string_pretty(nodes).unwrap_or_else(|_| "[]".to_string());
-    let state_json =
-        serde_json::to_string_pretty(accumulated_state).unwrap_or_else(|_| "[]".to_string());
+    let nodes_json = format_planning_nodes(nodes);
     let prior_contracts_json =
-        serde_json::to_string_pretty(prior_contracts).unwrap_or_else(|_| "[]".to_string());
+        format_prior_contract_context(prior_contracts, nodes, dependency_graph);
     let current_draft = if chapters.iter().any(|chapter| {
         chapter
             .rewrite_text
@@ -292,13 +292,10 @@ pub(crate) fn build_rewrite_plan_prompt(
 全局风格补充（仅影响表达）：
 {}
 
-已有改写连续性状态：
+相关改写连续性状态（已合并通过状态与本批前序计划，只保留当前关系线）：
 {}
 
-本批次前序计划状态：
-{}
-
-前序分片契约：
+前序分片依赖摘要（只含稳定 ID、章节和下游影响）：
 {}
 
 当前分析节点：
@@ -333,7 +330,6 @@ pub(crate) fn build_rewrite_plan_prompt(
         } else {
             continuity_json.trim()
         },
-        state_json,
         prior_contracts_json,
         nodes_json,
         current_draft,
