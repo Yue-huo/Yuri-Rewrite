@@ -14,6 +14,7 @@ pub(crate) struct ReviewRepairContext<'a> {
     pub(crate) shard_context: &'a str,
     pub(crate) shard_label: &'a str,
     pub(crate) decision: &'a ReviewDecision,
+    pub(crate) tagged_check: bool,
 }
 
 pub(crate) async fn repair_reviewed_shard(
@@ -33,6 +34,7 @@ pub(crate) async fn repair_reviewed_shard(
         context.shard_context,
         context.shard_label,
         context.decision,
+        context.tagged_check,
     )
     .await
 }

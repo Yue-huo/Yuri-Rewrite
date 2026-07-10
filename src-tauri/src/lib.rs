@@ -28,14 +28,14 @@ use rate_limit::RateLimitCoordinator;
 use regex::Regex;
 use repositories::{chapters::*, jobs::*, logs::*};
 use reqwest::Client;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use serde_json::json;
 use services::progress::*;
 use services::{estimation::*, shard_context::*};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
@@ -57,6 +57,7 @@ const GITHUB_LATEST_RELEASE_API_URL: &str =
     "https://api.github.com/repos/3minto1/Yuri-Rewrite/releases/latest";
 const AUTO_RUN_PAUSED: &str = "__YURI_AUTO_RUN_PAUSED__";
 const AUTO_RUN_TERMINATED: &str = "__YURI_AUTO_RUN_TERMINATED__";
+const QUALITY_GATE_PREFIX: &str = "__YURI_QUALITY_GATE__:";
 const WINDOW_STATE_FILE: &str = "window-state.json";
 const SYSTEM_ANALYSIS_EXPERT: &str = "你是严谨的中文长篇小说结构分析专家，擅长从原文中提取事实、人物、关系、地点、术语和性别线索。工作方式必须精确、克制、基于证据；只输出合法 JSON，不输出 Markdown 或解释。";
 const SYSTEM_ANALYSIS_JSON_REPAIR: &str = "你是中文小说分析 JSON 格式修复专家，只负责把输入修复为合法 JSON 对象，不新增事实、不改写正文、不输出 Markdown 或解释。";
@@ -439,6 +440,7 @@ async fn analyze_chapters_for_auto(
     .inspect_err(|error| {
         if error != AUTO_RUN_PAUSED
             && error != AUTO_RUN_TERMINATED
+            && !error.contains(QUALITY_GATE_PREFIX)
             && !is_recoverable_model_format_error(error)
         {
             let _ = mark_chapters_analysis_failed(state, &chapters);
@@ -749,7 +751,11 @@ fn parse_analysis_model_output(
     if let Some(error) = model_output_truncation_error(&output.raw_response) {
         return Err(error);
     }
-    parse_batch_analysis_output(&output.text, chapters)
+    let parsed = parse_batch_analysis_output(&output.text, chapters)?;
+    for analysis in &parsed {
+        parse_impact_nodes_from_analysis(&analysis.json, chapters)?;
+    }
+    Ok(parsed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -877,7 +883,7 @@ fn save_parsed_analyses(
         .map_err(to_string)?;
     }
     tx.commit().map_err(to_string)?;
-    merge_analysis_into_canon_assets(&conn, novel_id).map_err(to_string)?;
+    merge_analysis_into_canon_assets(&conn, novel_id)?;
     Ok(())
 }
 
@@ -1004,7 +1010,7 @@ fn apply_staged_analyses(
         .map_err(to_string)?;
     }
     tx.commit().map_err(to_string)?;
-    merge_analysis_into_canon_assets(&conn, novel_id).map_err(to_string)
+    merge_analysis_into_canon_assets(&conn, novel_id)
 }
 
 async fn ensure_name_mapping_asset(
@@ -1418,17 +1424,29 @@ async fn rewrite_chapters_for_auto(
         all_chapters,
         settings,
         core_prompt,
+        rewrite_strategy,
+        rewrite_check_mode,
         review_enabled,
         review_profile_id,
         rewrite_parallelism,
     ) = {
         let conn = state.conn.lock().map_err(to_string)?;
         let settings = require_novel_settings(&conn, novel_id)?;
+        let rewrite_strategy = load_rewrite_strategy(&conn)?;
+        let review_enabled = graph_strategy_name_enabled(&rewrite_strategy)
+            || load_review_enabled(&conn)?;
+        let core_prompt = if graph_strategy_name_enabled(&rewrite_strategy) {
+            load_style_prompt(&conn)?.0
+        } else {
+            load_core_prompt(&conn)?
+        };
         (
             load_chapters_for_batch(&conn, novel_id, batch_id)?,
             settings,
-            load_core_prompt(&conn)?,
-            load_review_enabled(&conn)?,
+            core_prompt,
+            rewrite_strategy,
+            load_rewrite_check_mode(&conn)?,
+            review_enabled,
             load_review_profile_id(&conn)?,
             load_rewrite_parallelism(&conn)?,
         )
@@ -1477,6 +1495,8 @@ async fn rewrite_chapters_for_auto(
             canon_text: &canon_text,
             settings: &settings,
             core_prompt: &core_prompt,
+            rewrite_strategy: &rewrite_strategy,
+            rewrite_check_mode: &rewrite_check_mode,
             review_enabled,
             review_profile: review_profile.as_ref(),
             review_api_key: review_api_key.as_deref(),
@@ -1488,6 +1508,7 @@ async fn rewrite_chapters_for_auto(
     .inspect_err(|error| {
         if error != AUTO_RUN_PAUSED
             && error != AUTO_RUN_TERMINATED
+            && !error.contains(QUALITY_GATE_PREFIX)
             && !is_recoverable_model_format_error(error)
         {
             let _ = mark_chapters_rewrite_failed(state, &chapters);
@@ -1507,6 +1528,8 @@ async fn rewrite_batch_with_parallelism(
     canon_text: &str,
     settings: &NovelSettings,
     core_prompt: &str,
+    rewrite_strategy: &str,
+    rewrite_check_mode: &str,
     review_enabled: bool,
     review_profile: Option<&ModelProfile>,
     review_api_key: Option<&str>,
@@ -1534,6 +1557,8 @@ async fn rewrite_batch_with_parallelism(
                 canon_text,
                 settings,
                 core_prompt,
+                rewrite_strategy,
+                rewrite_check_mode,
                 parallelism: rewrite_parallelism,
                 checkpoint_batch_index,
             },
@@ -1615,6 +1640,9 @@ async fn generate_rewrite_shards(
                 &readonly_context,
                 &shard_label,
                 review_enabled,
+                LEGACY_REWRITE_STRATEGY,
+                REWRITE_CHECK_OFF,
+                None,
             )
             .await;
             Ok::<_, String>((idx, shard_label, shard, parsed))
@@ -1673,15 +1701,49 @@ async fn generate_single_rewrite_shard(
     readonly_adjacent_context: &str,
     shard_label: &str,
     review_enabled: bool,
+    rewrite_strategy: &str,
+    rewrite_check_mode: &str,
+    rewrite_plan: Option<&RewritePlan>,
 ) -> Result<Vec<ParsedChapterRewrite>, String> {
     let shard_canon_text = build_relevant_canon_text_from_text(canon_text, shard, settings);
-    let prompt = build_batch_rewrite_prompt_with_context(
-        shard,
-        &shard_canon_text,
-        settings,
-        core_prompt,
-        shard_context,
-    );
+    let graph_strategy = graph_strategy_name_enabled(rewrite_strategy);
+    let tagged_check = graph_strategy && rewrite_check_mode == REWRITE_CHECK_TAGGED;
+    let prompt = if graph_strategy {
+        let plan = rewrite_plan.ok_or_else(|| "主角主动重构缺少分片改写契约。".to_string())?;
+        let (nodes, continuity_json) = {
+            let conn = state.conn.lock().map_err(to_string)?;
+            let graph = load_canon_asset_content(&conn, novel_id, IMPACT_GRAPH_ASSET_KIND)?
+                .map(|content| parse_impact_graph(&content))
+                .unwrap_or_default();
+            let nodes = impact_nodes_for_chapters(&graph, shard);
+            let continuity = load_canon_asset_content(
+                &conn,
+                novel_id,
+                REWRITE_CONTINUITY_ASSET_KIND,
+            )?
+            .unwrap_or_else(|| "[]".to_string());
+            (nodes, continuity)
+        };
+        build_graph_rewrite_prompt_with_context(
+            shard,
+            &shard_canon_text,
+            settings,
+            core_prompt,
+            shard_context,
+            plan,
+            &nodes,
+            &continuity_json,
+            tagged_check,
+        )
+    } else {
+        build_batch_rewrite_prompt_with_context(
+            shard,
+            &shard_canon_text,
+            settings,
+            core_prompt,
+            shard_context,
+        )
+    };
     let output = generate_text(
         &state.client,
         Some(state.rate_limits.clone()),
@@ -1705,7 +1767,7 @@ async fn generate_single_rewrite_shard(
                 output.reasoning.as_deref(),
                 Some(&output.raw_response),
             )?;
-            match parse_rewrite_model_output(&output, shard) {
+            match parse_rewrite_model_output_with_check(&output, shard, tagged_check) {
                 Ok(parsed) => Ok(parsed),
                 Err(error) => {
                     append_ai_log(
@@ -1719,6 +1781,37 @@ async fn generate_single_rewrite_shard(
                         output.reasoning.as_deref(),
                         Some(&output.raw_response),
                     )?;
+                    if graph_strategy {
+                        let repair_prompt = format!(
+                            "上次输出格式校验失败：{error}\n请按原要求重新输出完整分片。不要减少或改变契约义务。\n\n{prompt}"
+                        );
+                        let repaired = generate_text(
+                            &state.client,
+                            Some(state.rate_limits.clone()),
+                            profile,
+                            api_key,
+                            SYSTEM_REWRITE_FORMAT_REPAIR,
+                            &repair_prompt,
+                            false,
+                        )
+                        .await?;
+                        append_ai_log(
+                            state,
+                            Some(novel_id),
+                            &profile.id,
+                            "批次改写格式修复",
+                            Some(shard_label),
+                            "success",
+                            &format_model_log_content(&repaired, profile, Some(review_enabled)),
+                            repaired.reasoning.as_deref(),
+                            Some(&repaired.raw_response),
+                        )?;
+                        return parse_rewrite_model_output_with_check(
+                            &repaired,
+                            shard,
+                            tagged_check,
+                        );
+                    }
                     match retry_rewrite_shard_after_parse_error(
                         state,
                         novel_id,
@@ -1966,6 +2059,8 @@ async fn generate_reviewed_rewrite_pipeline(
     canon_text: &str,
     settings: &NovelSettings,
     core_prompt: &str,
+    rewrite_strategy: &str,
+    rewrite_check_mode: &str,
     rewrite_parallelism: usize,
     checkpoint_batch_index: Option<i64>,
 ) -> Result<Vec<ParsedChapterRewrite>, String> {
@@ -1984,7 +2079,16 @@ async fn generate_reviewed_rewrite_pipeline(
         all_chapters.len(),
         completed_chapter_ids_before_resume(all_chapters, chapters),
     )?;
-    let tasks = stream::iter(shard_work.into_iter().enumerate().map(|(idx, work)| {
+    let graph_strategy = graph_strategy_name_enabled(rewrite_strategy);
+    let staged_drafts = checkpoint_batch_index
+        .map(|batch_index| load_staged_outputs(state, novel_id, batch_index, "rewrite_draft"))
+        .transpose()?
+        .unwrap_or_default();
+    let run_id = Uuid::new_v4().to_string();
+    let mut accumulated_state = Vec::<RewriteStateUpdate>::new();
+    let mut prior_contracts = Vec::<RewritePlan>::new();
+    let mut prepared = Vec::with_capacity(shard_total);
+    for (idx, work) in shard_work.into_iter().enumerate() {
         let shard = work.chapters.clone();
         let shard_label = format_shard_label(&batch_label, idx, shard_total, &shard);
         let readonly_context = build_readonly_adjacent_context(&work, &staged, "rewrite");
@@ -1996,72 +2100,147 @@ async fn generate_reviewed_rewrite_pipeline(
             &shard,
             &readonly_context,
         );
-        async move {
-            report_auto_shard_started(state, novel_id, "rewrite", idx, shard_total, &shard)?;
-            let rewrite_shard = generate_single_rewrite_shard(
-                state,
-                novel_id,
-                rewrite_profile,
-                rewrite_api_key,
-                &shard,
-                canon_text,
-                settings,
-                core_prompt,
-                &context,
-                &readonly_context,
-                &shard_label,
-                true,
-            )
-            .await
-            .map_err(|error| format!("{}：{}", shard_label, error))?;
-            report_auto_shard_phase(state, novel_id, idx, "review")?;
-            let reviewed = review_rewrite_shard_strict(
-                state,
-                novel_id,
-                rewrite_profile,
-                rewrite_api_key,
-                review_profile,
-                review_api_key,
-                &shard,
-                rewrite_shard,
-                canon_text,
-                settings,
-                core_prompt,
-                &context,
-                &shard_label,
-                idx,
-            )
-            .await?;
-            Ok::<_, String>((idx, shard_label, shard, reviewed))
-        }
-    }))
-    .buffer_unordered(rewrite_parallelism);
-    futures_util::pin_mut!(tasks);
+        let mut reusable_draft = if graph_strategy {
+            staged_draft_for_shard(&shard, &staged_drafts)
+        } else {
+            None
+        };
+        let plan = if graph_strategy {
+            report_auto_shard_started(state, novel_id, "planning", idx, shard_total, &shard)?;
+            let reusable_plan = if reusable_draft.is_some() {
+                load_reusable_rewrite_plan(state, &shard)?
+            } else {
+                None
+            };
+            if reusable_draft.is_some() && reusable_plan.is_none() {
+                reusable_draft = None;
+            }
+            let plan = if let Some(plan) = reusable_plan {
+                plan
+            } else {
+                services::planning::plan_rewrite_shard(
+                    state,
+                    services::planning::RewritePlanningContext {
+                        novel_id,
+                        profile: rewrite_profile,
+                        api_key: rewrite_api_key,
+                        chapters: &shard,
+                        settings,
+                        style_prompt: core_prompt,
+                        accumulated_state: &accumulated_state,
+                        prior_contracts: &prior_contracts,
+                        run_id: &run_id,
+                        batch_index: checkpoint_batch_index,
+                        shard_label: &shard_label,
+                    },
+                )
+                .await
+                .map_err(|error| format!("{}：规划失败：{}", shard_label, error))?
+            };
+            accumulated_state.extend(plan.planned_state_updates.iter().cloned());
+            for obligation in &plan.obligations {
+                accumulated_state.extend(obligation.planned_state_updates.iter().cloned());
+            }
+            prior_contracts.push(plan.clone());
+            Some(plan)
+        } else {
+            None
+        };
+        let dependency_level = plan
+            .as_ref()
+            .filter(|plan| !plan.cross_shard_dependencies.is_empty())
+            .map_or(0, |_| idx + 1);
+        prepared.push((dependency_level, idx, shard, shard_label, readonly_context, context, plan, reusable_draft));
+    }
 
+    let mut waves = BTreeMap::<usize, Vec<_>>::new();
+    for item in prepared {
+        waves.entry(item.0).or_default().push(item);
+    }
     let mut parsed_by_shard = Vec::new();
-    loop {
-        let result = tokio::select! {
-            result = tasks.next() => result,
-            _ = tokio::time::sleep(Duration::from_millis(300)) => {
-                if let Some(status) = requested_auto_run_stop(state, novel_id)? {
-                    return Err(status);
-                }
-                continue;
-            }
-        };
-        let Some(result) = result else {
-            break;
-        };
-        match result {
-            Ok((idx, _, shard, parsed)) => {
+    for (_, wave) in waves {
+        let tasks = stream::iter(wave.into_iter().map(
+            |(_, idx, shard, shard_label, readonly_context, context, plan, reusable_draft)| {
+            async move {
+                report_auto_shard_started(state, novel_id, "rewrite", idx, shard_total, &shard)?;
+                let rewrite_shard = if let Some(draft) = reusable_draft {
+                    draft
+                } else {
+                    generate_single_rewrite_shard(
+                        state,
+                        novel_id,
+                        rewrite_profile,
+                        rewrite_api_key,
+                        &shard,
+                        canon_text,
+                        settings,
+                        core_prompt,
+                        &context,
+                        &readonly_context,
+                        &shard_label,
+                        true,
+                        rewrite_strategy,
+                        rewrite_check_mode,
+                        plan.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| format!("{}：{}", shard_label, error))?
+                };
                 if let Some(batch_index) = checkpoint_batch_index {
-                    stage_rewrite_shard(state, novel_id, batch_index, &parsed)?;
+                    stage_rewrite_draft_shard(
+                        state,
+                        novel_id,
+                        batch_index,
+                        &rewrite_shard,
+                    )?;
                 }
-                report_auto_shard_completed(state, novel_id, idx, &shard)?;
-                parsed_by_shard.push((idx, parsed))
+                report_auto_shard_phase(state, novel_id, idx, "review")?;
+                let reviewed = review_rewrite_shard_strict(
+                    state,
+                    novel_id,
+                    rewrite_profile,
+                    rewrite_api_key,
+                    review_profile,
+                    review_api_key,
+                    &shard,
+                    rewrite_shard,
+                    canon_text,
+                    settings,
+                    core_prompt,
+                    &context,
+                    &shard_label,
+                idx,
+                plan.as_ref(),
+                rewrite_check_mode == REWRITE_CHECK_TAGGED,
+                )
+                .await?;
+                Ok::<_, String>((idx, shard_label, shard, reviewed))
             }
-            Err(error) => {
-                return Err(error);
+        }))
+        .buffer_unordered(rewrite_parallelism);
+        futures_util::pin_mut!(tasks);
+        loop {
+            let result = tokio::select! {
+                result = tasks.next() => result,
+                _ = tokio::time::sleep(Duration::from_millis(300)) => {
+                    if let Some(status) = requested_auto_run_stop(state, novel_id)? {
+                        return Err(status);
+                    }
+                    continue;
+                }
+            };
+            let Some(result) = result else {
+                break;
+            };
+            match result {
+                Ok((idx, _, shard, parsed)) => {
+                    if let Some(batch_index) = checkpoint_batch_index {
+                        stage_rewrite_shard(state, novel_id, batch_index, &parsed)?;
+                    }
+                    report_auto_shard_completed(state, novel_id, idx, &shard)?;
+                    parsed_by_shard.push((idx, parsed))
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -2089,7 +2268,20 @@ async fn review_rewrite_shard_strict(
     shard_context: &str,
     shard_label: &str,
     progress_shard_index: usize,
+    rewrite_plan: Option<&RewritePlan>,
+    tagged_check: bool,
 ) -> Result<Vec<ParsedChapterRewrite>, String> {
+    let repair_core_prompt = rewrite_plan.map_or_else(
+        || core_prompt.to_string(),
+        |plan| {
+            format!(
+                "{}\n\n【当前分片强制改写契约】\n{}\n\n【低优先级全局文风补充】\n{}",
+                protagonist_rule_pack(),
+                format_rewrite_contract(plan),
+                prompt_context_or_none(core_prompt)
+            )
+        },
+    );
     let first_decision = review_shard_decision(
         state,
         novel_id,
@@ -2104,6 +2296,7 @@ async fn review_rewrite_shard_strict(
         shard_label,
         "批次审查决策",
         SYSTEM_REVIEW_DECISION_EXPERT,
+        rewrite_plan,
     )
     .await?;
     if first_decision.approved {
@@ -2131,10 +2324,11 @@ async fn review_rewrite_shard_strict(
             rewrites: &rewrite_shard,
             canon_text,
             settings,
-            core_prompt,
+            core_prompt: &repair_core_prompt,
             shard_context,
             shard_label,
             decision: &first_decision,
+            tagged_check,
         },
     )
     .await?;
@@ -2152,6 +2346,7 @@ async fn review_rewrite_shard_strict(
         canon_text,
         shard_context,
         &second_label,
+        rewrite_plan,
     )
     .await?;
     if second_decision.approved {
@@ -2179,10 +2374,11 @@ async fn review_rewrite_shard_strict(
             rewrites: &revised,
             canon_text,
             settings,
-            core_prompt,
+            core_prompt: &repair_core_prompt,
             shard_context,
             shard_label,
             decision: &second_decision,
+            tagged_check,
         },
     )
     .await?;
@@ -2200,6 +2396,7 @@ async fn review_rewrite_shard_strict(
         canon_text,
         shard_context,
         &third_label,
+        rewrite_plan,
     )
     .await?;
     if third_decision.approved {
@@ -2207,6 +2404,27 @@ async fn review_rewrite_shard_strict(
     }
     let warning_log_result =
         append_review_warning_file(state, novel_id, shard_label, &third_decision);
+    if rewrite_plan.is_some() {
+        append_ai_log(
+            state,
+            Some(novel_id),
+            &review_profile.id,
+            "主角主动重构质量门未通过",
+            Some(shard_label),
+            "error",
+            &format!(
+                "第三次覆盖审查仍未通过，当前草稿不会写入章节。\n警告日志：{}\n\n阻断问题：\n{}",
+                warning_log_result,
+                review_issues_text(&third_decision.issues)
+            ),
+            None,
+            None,
+        )?;
+        return Err(format!(
+            "{}{} 第三次覆盖审查仍未通过，草稿已保留但未保存为改写稿。",
+            QUALITY_GATE_PREFIX, shard_label
+        ));
+    }
     append_ai_log(
         state,
         Some(novel_id),
@@ -2240,15 +2458,28 @@ async fn review_shard_decision(
     shard_label: &str,
     log_action: &str,
     system_prompt: &str,
+    rewrite_plan: Option<&RewritePlan>,
 ) -> Result<ReviewDecision, String> {
-    let prompt = build_batch_review_decision_prompt_with_context(
-        shard,
-        rewrites,
-        settings,
-        core_prompt,
-        canon_text,
-        shard_context,
-    );
+    let prompt = if let Some(plan) = rewrite_plan {
+        build_graph_review_decision_prompt(
+            shard,
+            rewrites,
+            settings,
+            core_prompt,
+            canon_text,
+            shard_context,
+            plan,
+        )
+    } else {
+        build_batch_review_decision_prompt_with_context(
+            shard,
+            rewrites,
+            settings,
+            core_prompt,
+            canon_text,
+            shard_context,
+        )
+    };
     let output = generate_text(
         &state.client,
         Some(state.rate_limits.clone()),
@@ -2272,19 +2503,18 @@ async fn review_shard_decision(
                 output.reasoning.as_deref(),
                 Some(&output.raw_response),
             )?;
-            match parse_review_decision_output(&output.text, settings) {
-                Ok(decision) => services::validation::validate_review_decision(
-                    state,
-                    decision,
-                    services::validation::ReviewValidationContext {
-                        novel_id,
-                        profile_id: &profile.id,
-                        shard_label,
-                        shard,
-                        rewrites,
-                        settings,
-                    },
-                ),
+            match validate_review_model_output(
+                state,
+                novel_id,
+                &profile.id,
+                shard_label,
+                &output.text,
+                shard,
+                rewrites,
+                settings,
+                rewrite_plan,
+            ) {
+                Ok(decision) => Ok(decision),
                 Err(error) => {
                     append_ai_log(
                         state,
@@ -2300,8 +2530,14 @@ async fn review_shard_decision(
                         output.reasoning.as_deref(),
                         Some(&output.raw_response),
                     )?;
-                    let repair_prompt =
-                        build_review_decision_json_repair_prompt(&output.text, &error, settings);
+                    let repair_prompt = if rewrite_plan.is_some() {
+                        format!(
+                            "审查 JSON 校验失败：{error}\n只修复 JSON 结构和字段完整性，不重新审查、不改变 coverage 状态或证据。必须保留 coverage、issues、state_updates。\n\n原审查要求：\n{prompt}\n\n待修复输出：\n{}",
+                            output.text
+                        )
+                    } else {
+                        build_review_decision_json_repair_prompt(&output.text, &error, settings)
+                    };
                     let repair_output = generate_text(
                         &state.client,
                         Some(state.rate_limits.clone()),
@@ -2325,19 +2561,18 @@ async fn review_shard_decision(
                                 repair_output.reasoning.as_deref(),
                                 Some(&repair_output.raw_response),
                             )?;
-                            match parse_review_decision_output(&repair_output.text, settings) {
-                                Ok(decision) => services::validation::validate_review_decision(
-                                    state,
-                                    decision,
-                                    services::validation::ReviewValidationContext {
-                                        novel_id,
-                                        profile_id: &profile.id,
-                                        shard_label,
-                                        shard,
-                                        rewrites,
-                                        settings,
-                                    },
-                                ),
+                            match validate_review_model_output(
+                                state,
+                                novel_id,
+                                &profile.id,
+                                shard_label,
+                                &repair_output.text,
+                                shard,
+                                rewrites,
+                                settings,
+                                rewrite_plan,
+                            ) {
+                                Ok(decision) => Ok(decision),
                                 Err(repair_error) => {
                                     append_ai_log(
                                         state,
@@ -2449,6 +2684,137 @@ fn finalize_review_decision(
         )?;
     }
     Ok(decision)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_review_model_output(
+    state: &State<'_, AppState>,
+    novel_id: &str,
+    profile_id: &str,
+    shard_label: &str,
+    output: &str,
+    shard: &[Chapter],
+    rewrites: &[ParsedChapterRewrite],
+    settings: &NovelSettings,
+    rewrite_plan: Option<&RewritePlan>,
+) -> Result<ReviewDecision, String> {
+    let (raw_decision, coverage, state_updates) = if let Some(plan) = rewrite_plan {
+        let parsed = parse_rewrite_review_decision_output(output, settings, plan, rewrites)?;
+        (parsed.decision, parsed.coverage, parsed.state_updates)
+    } else {
+        (
+            parse_review_decision_output(output, settings)?,
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+    let decision = finalize_review_decision(
+        state,
+        novel_id,
+        profile_id,
+        shard_label,
+        raw_decision,
+        shard,
+        rewrites,
+        settings,
+    )?;
+    if let Some(plan) = rewrite_plan {
+        persist_rewrite_review_result(
+            state,
+            novel_id,
+            shard,
+            plan,
+            &decision,
+            &coverage,
+            &state_updates,
+        )?;
+    }
+    Ok(decision)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_rewrite_review_result(
+    state: &State<'_, AppState>,
+    novel_id: &str,
+    shard: &[Chapter],
+    plan: &RewritePlan,
+    decision: &ReviewDecision,
+    coverage: &[ReviewCoverageItem],
+    state_updates: &[RewriteStateUpdate],
+) -> Result<(), String> {
+    let now = Utc::now().to_rfc3339();
+    let coverage_json = serde_json::to_string_pretty(&serde_json::json!({
+        "approved": decision.approved,
+        "coverage": coverage,
+        "state_updates": state_updates,
+    }))
+    .map_err(to_string)?;
+    let obligations = plan
+        .obligations
+        .iter()
+        .map(|obligation| (obligation.obligation_id.as_str(), obligation.chapter_index))
+        .collect::<HashMap<_, _>>();
+    let mut conn = state.conn.lock().map_err(to_string)?;
+    let tx = conn.transaction().map_err(to_string)?;
+    for chapter in shard {
+        let satisfied = coverage
+            .iter()
+            .filter(|item| {
+                item.status == "satisfied"
+                    && obligations
+                        .get(item.obligation_id.as_str())
+                        .is_some_and(|chapter_index| *chapter_index == chapter.index)
+            })
+            .count();
+        tx.execute(
+            "UPDATE rewrite_contracts
+             SET coverage_json = ?1, validation_status = ?2,
+                 obligation_satisfied = ?3, updated_at = ?4
+             WHERE chapter_id = ?5",
+            params![
+                coverage_json,
+                if decision.approved { "passed" } else { "failed" },
+                satisfied,
+                now,
+                chapter.id
+            ],
+        )
+        .map_err(to_string)?;
+    }
+    if decision.approved {
+        let existing = load_canon_asset_content(
+            &tx,
+            novel_id,
+            REWRITE_CONTINUITY_ASSET_KIND,
+        )?
+        .and_then(|content| serde_json::from_str::<Vec<RewriteStateUpdate>>(&content).ok())
+        .unwrap_or_default();
+        let mut merged = existing
+            .into_iter()
+            .map(|item| ((item.thread_key.clone(), item.state_type.clone()), item))
+            .collect::<HashMap<_, _>>();
+        for update in state_updates {
+            let key = (update.thread_key.clone(), update.state_type.clone());
+            let should_replace = merged
+                .get(&key)
+                .is_none_or(|current| update.chapter_index >= current.chapter_index);
+            if should_replace {
+                merged.insert(key, update.clone());
+            }
+        }
+        let mut states = merged.into_values().collect::<Vec<_>>();
+        states.sort_by_key(|state| (state.chapter_index, state.thread_key.clone(), state.state_type.clone()));
+        let content = serde_json::to_string_pretty(&states).map_err(to_string)?;
+        upsert_canon_asset(
+            &tx,
+            novel_id,
+            REWRITE_CONTINUITY_ASSET_KIND,
+            &content,
+            &now,
+        )
+        .map_err(to_string)?;
+    }
+    tx.commit().map_err(to_string)
 }
 
 fn review_decision_parse_error_message(shard_label: &str, error: &str) -> String {
@@ -3955,6 +4321,162 @@ fn parse_review_decision_output(
     Ok(ReviewDecision { approved, issues })
 }
 
+fn parse_rewrite_review_decision_output(
+    output: &str,
+    settings: &NovelSettings,
+    plan: &RewritePlan,
+    rewrites: &[ParsedChapterRewrite],
+) -> Result<RewriteReviewDecision, String> {
+    let mut decision = parse_review_decision_output(output, settings)?;
+    let value = parse_jsonish_value(output)?;
+    let coverage = value
+        .get("coverage")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(serde_json::from_value::<ReviewCoverageItem>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("coverage 字段无效：{error}"))?;
+    let state_updates = value
+        .get("state_updates")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(serde_json::from_value::<RewriteStateUpdate>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("state_updates 字段无效：{error}"))?;
+
+    let expected = plan
+        .obligations
+        .iter()
+        .map(|obligation| (obligation.obligation_id.as_str(), obligation))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    for item in &coverage {
+        let Some(obligation) = expected.get(item.obligation_id.as_str()) else {
+            decision.issues.push(ReviewIssue {
+                chapter_indexes: item.chapter_indexes.clone(),
+                scope: "chapter".to_string(),
+                category: "obligation_coverage".to_string(),
+                severity: "blocking".to_string(),
+                problem: format!("coverage 引用了未知义务 {}。", item.obligation_id),
+                required_fix: "仅按当前契约逐项重新验收。".to_string(),
+            });
+            continue;
+        };
+        if !seen.insert(item.obligation_id.clone()) {
+            decision.issues.push(ReviewIssue {
+                chapter_indexes: vec![obligation.chapter_index],
+                scope: "chapter".to_string(),
+                category: "obligation_coverage".to_string(),
+                severity: "blocking".to_string(),
+                problem: format!("义务 {} 在 coverage 中重复出现。", item.obligation_id),
+                required_fix: "每个义务只能输出一个 coverage 项。".to_string(),
+            });
+        }
+        if !matches!(item.status.as_str(), "satisfied" | "partial" | "missed" | "regressed") {
+            return Err(format!(
+                "义务 {} 使用了未知 coverage 状态：{}",
+                item.obligation_id, item.status
+            ));
+        }
+        let evidence_exists = services::coverage::evidence_exists_in_rewrite(item, rewrites);
+        if item.status != "satisfied" || !evidence_exists {
+            decision.issues.push(ReviewIssue {
+                chapter_indexes: vec![obligation.chapter_index],
+                scope: "chapter".to_string(),
+                category: "obligation_coverage".to_string(),
+                severity: "blocking".to_string(),
+                problem: if item.status == "satisfied" {
+                    format!(
+                        "义务 {} 的 satisfied 证据无法在当前改写稿中定位。",
+                        item.obligation_id
+                    )
+                } else {
+                    format!("义务 {} 状态为 {}。", item.obligation_id, item.status)
+                },
+                required_fix: format!(
+                    "定向完成义务 {}：{}",
+                    item.obligation_id,
+                    obligation.required_changes.join("；")
+                ),
+            });
+        }
+    }
+    for obligation in &plan.obligations {
+        if !seen.contains(&obligation.obligation_id) {
+            decision.issues.push(ReviewIssue {
+                chapter_indexes: vec![obligation.chapter_index],
+                scope: "chapter".to_string(),
+                category: "obligation_coverage".to_string(),
+                severity: "blocking".to_string(),
+                problem: format!("coverage 遗漏义务 {}。", obligation.obligation_id),
+                required_fix: format!(
+                    "验收并完成：{}",
+                    obligation.required_changes.join("；")
+                ),
+            });
+        }
+    }
+
+    let expected_states = plan
+        .planned_state_updates
+        .iter()
+        .chain(
+            plan.obligations
+                .iter()
+                .flat_map(|obligation| obligation.planned_state_updates.iter()),
+        )
+        .collect::<Vec<_>>();
+    for expected_state in &expected_states {
+        if !state_updates.iter().any(|actual| {
+            actual.thread_key == expected_state.thread_key
+                && actual.state_type == expected_state.state_type
+                && actual.value == expected_state.value
+        }) {
+            decision.issues.push(ReviewIssue {
+                chapter_indexes: vec![expected_state.chapter_index],
+                scope: "cross_chapter".to_string(),
+                category: "continuity".to_string(),
+                severity: "blocking".to_string(),
+                problem: format!(
+                    "复检状态未确认计划状态 {} / {}。",
+                    expected_state.thread_key, expected_state.state_type
+                ),
+                required_fix: "修复正文后返回与契约一致的 state_updates。".to_string(),
+            });
+        }
+    }
+    for actual in &state_updates {
+        if !expected_states.iter().any(|expected| {
+            actual.thread_key == expected.thread_key
+                && actual.state_type == expected.state_type
+                && actual.value == expected.value
+        }) {
+            decision.issues.push(ReviewIssue {
+                chapter_indexes: vec![actual.chapter_index],
+                scope: "cross_chapter".to_string(),
+                category: "continuity".to_string(),
+                severity: "blocking".to_string(),
+                problem: format!(
+                    "复检返回了契约未计划的状态 {} / {}。",
+                    actual.thread_key, actual.state_type
+                ),
+                required_fix: "删除未计划状态，或重新规划后再生成正文。".to_string(),
+            });
+        }
+    }
+    decision.approved =
+        services::coverage::coverage_gate_passes(plan, &coverage, &decision.issues);
+    Ok(RewriteReviewDecision {
+        decision,
+        coverage,
+        state_updates,
+    })
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum RevisionPlan {
     Targeted(Vec<i64>),
@@ -4194,6 +4716,7 @@ async fn revise_rewrite_shard_after_review(
     shard_context: &str,
     shard_label: &str,
     decision: &ReviewDecision,
+    tagged_check: bool,
 ) -> Result<Vec<ParsedChapterRewrite>, String> {
     let target_indexes = match plan_review_revision(shard, decision) {
         RevisionPlan::Targeted(indexes) => indexes,
@@ -4222,6 +4745,7 @@ async fn revise_rewrite_shard_after_review(
                 shard_context,
                 shard_label,
                 decision,
+                tagged_check,
             )
             .await;
         }
@@ -4255,7 +4779,7 @@ async fn revise_rewrite_shard_after_review(
     let adjacent_context = build_targeted_revision_context(shard, rewrites, &target_set);
     let targeted_canon_text =
         build_relevant_canon_text_from_text(canon_text, &target_chapters, settings);
-    let prompt = build_targeted_revision_prompt(
+    let prompt = require_tagged_rewrite_output(build_targeted_revision_prompt(
         &target_chapters,
         &target_rewrites,
         &targeted_canon_text,
@@ -4264,7 +4788,7 @@ async fn revise_rewrite_shard_after_review(
         shard_context,
         &target_issues,
         &adjacent_context,
-    );
+    ), tagged_check);
     append_ai_log(
         state,
         Some(novel_id),
@@ -4311,8 +4835,10 @@ async fn revise_rewrite_shard_after_review(
                 output.reasoning.as_deref(),
                 Some(&output.raw_response),
             )?;
-            validate_targeted_rewrite_markers(&output.text, &target_chapters)
-                .and_then(|_| parse_rewrite_model_output(&output, &target_chapters))
+            let parsed_text = parse_rewrite_output_envelope(&output.text, tagged_check);
+            parsed_text
+                .and_then(|text| validate_targeted_rewrite_markers(&text, &target_chapters).map(|_| text))
+                .and_then(|text| parse_batch_rewrite_output(&text, &target_chapters))
                 .and_then(|parsed| merge_targeted_rewrites(rewrites, parsed, &target_indexes))
         }
         Err(error) => Err(error),
@@ -4347,6 +4873,7 @@ async fn revise_rewrite_shard_after_review(
                 shard_context,
                 shard_label,
                 decision,
+                tagged_check,
             )
             .await
         }
@@ -4367,8 +4894,9 @@ async fn revise_full_rewrite_shard_after_review(
     shard_context: &str,
     shard_label: &str,
     decision: &ReviewDecision,
+    tagged_check: bool,
 ) -> Result<Vec<ParsedChapterRewrite>, String> {
-    let prompt = build_batch_revision_prompt_with_context(
+    let prompt = require_tagged_rewrite_output(build_batch_revision_prompt_with_context(
         shard,
         rewrites,
         canon_text,
@@ -4376,7 +4904,7 @@ async fn revise_full_rewrite_shard_after_review(
         core_prompt,
         shard_context,
         decision,
-    );
+    ), tagged_check);
     let output = generate_text(
         &state.client,
         Some(state.rate_limits.clone()),
@@ -4400,7 +4928,7 @@ async fn revise_full_rewrite_shard_after_review(
                 output.reasoning.as_deref(),
                 Some(&output.raw_response),
             )?;
-            match parse_rewrite_model_output(&output, shard) {
+            match parse_rewrite_model_output_with_check(&output, shard, tagged_check) {
                 Ok(parsed) => Ok(parsed),
                 Err(error) => {
                     append_ai_log(
@@ -4414,6 +4942,33 @@ async fn revise_full_rewrite_shard_after_review(
                         output.reasoning.as_deref(),
                         Some(&output.raw_response),
                     )?;
+                    if tagged_check {
+                        let repair_prompt = format!(
+                            "上次修复输出的短自检包装或 marker 格式无效：{error}\n请按原修复要求重新输出；必须且只能包含唯一 <rewrite_check> 和唯一 <output>。\n\n{prompt}"
+                        );
+                        let repaired = generate_text(
+                            &state.client,
+                            Some(state.rate_limits.clone()),
+                            profile,
+                            api_key,
+                            SYSTEM_REVIEW_REVISION_REPAIR,
+                            &repair_prompt,
+                            false,
+                        )
+                        .await?;
+                        append_ai_log(
+                            state,
+                            Some(novel_id),
+                            &profile.id,
+                            "批次打回重写格式修复",
+                            Some(shard_label),
+                            "success",
+                            &format_model_log_content(&repaired, profile, Some(true)),
+                            repaired.reasoning.as_deref(),
+                            Some(&repaired.raw_response),
+                        )?;
+                        return parse_rewrite_model_output_with_check(&repaired, shard, true);
+                    }
                     match retry_revision_shard_after_parse_error(
                         state,
                         novel_id,
@@ -4484,6 +5039,7 @@ async fn review_revised_shard(
     canon_text: &str,
     shard_context: &str,
     shard_label: &str,
+    rewrite_plan: Option<&RewritePlan>,
 ) -> Result<ReviewDecision, String> {
     review_shard_decision(
         state,
@@ -4499,6 +5055,7 @@ async fn review_revised_shard(
         shard_label,
         "批次审查复判",
         SYSTEM_REVIEW_FINAL_EXPERT,
+        rewrite_plan,
     )
     .await
 }
@@ -4607,6 +5164,103 @@ fn parse_rewrite_model_output(
         return Err(error);
     }
     parse_batch_rewrite_output(&output.text, chapters)
+}
+
+fn require_tagged_rewrite_output(prompt: String, tagged_check: bool) -> String {
+    if !tagged_check {
+        return prompt;
+    }
+    format!(
+        "{prompt}\n\n【高级短自检包装】\n输出必须且只能包含一次 <rewrite_check>短核对</rewrite_check> 和一次 <output>完整 marker、标题与正文</output>；<output> 外不得有正文，标签不得重复或嵌入正文。"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_graph_review_decision_prompt(
+    chapters: &[Chapter],
+    rewrites: &[ParsedChapterRewrite],
+    settings: &NovelSettings,
+    style_prompt: &str,
+    canon_text: &str,
+    shard_context: &str,
+    plan: &RewritePlan,
+) -> String {
+    let contract = format_rewrite_contract(plan);
+    let constraints = build_compact_review_constraints(settings, style_prompt, canon_text);
+    format!(
+        r#"你是主角主动重构质量门。只输出一个合法 JSON 对象，不输出 Markdown 或解释。
+
+{rule_pack}
+
+审批硬条件：
+1. 契约中的每个 obligation_id 必须在 coverage 中恰好出现一次，不能出现未知义务。
+2. 逐项比较原文、契约和当前改写稿；只有发生了 required_changes 所要求的可见深层变化，status 才能是 satisfied。
+3. 姓名、代词、称谓或外貌变化不能单独证明义务满足；partial、missed、regressed 一律 blocking。
+4. coverage.evidence 必须逐字引用当前改写稿中真实存在的短证据；不得引用原文、契约或自行概括。
+5. 剧情、结果、能力、身份、关系性质、marker、边界或连续性回归均为 blocking。
+6. state_updates 必须与契约 planned_state_updates 一致，只报告本稿确实建立且可供后文使用的状态。
+
+输出结构：
+{{
+  "approved": false,
+  "coverage": [{{
+    "obligation_id": "O-...",
+    "status": "satisfied | partial | missed | regressed",
+    "chapter_indexes": [1],
+    "evidence": "当前改写稿逐字短引用"
+  }}],
+  "issues": [{{
+    "chapter_indexes": [1],
+    "scope": "chapter | cross_chapter",
+    "category": "obligation_coverage | plot | identity | ability | boundary | continuity | marker",
+    "severity": "blocking",
+    "problem": "具体问题",
+    "required_fix": "按义务 ID 说明必须如何修复"
+  }}],
+  "state_updates": [{{
+    "thread_key": "关系线",
+    "state_type": "状态类型",
+    "value": "最新有效状态",
+    "chapter_index": 1,
+    "source_obligation_ids": ["O-..."]
+  }}]
+}}
+
+只有 coverage 全部 satisfied、证据真实、issues 为空且 state_updates 与计划一致时 approved 才能为 true。
+
+复检约束：
+{constraints}
+
+当前分片契约：
+{contract}
+
+处理范围：
+{shard_context}
+
+原文章节：
+{original}
+
+待审查改写稿：
+{rewrite}"#,
+        rule_pack = protagonist_rule_pack(),
+        constraints = constraints,
+        contract = contract,
+        shard_context = prompt_context_or_none(shard_context),
+        original = build_batch_chapter_text(chapters, false),
+        rewrite = build_batch_rewrite_text(chapters, rewrites),
+    )
+}
+
+fn parse_rewrite_model_output_with_check(
+    output: &ModelOutput,
+    chapters: &[Chapter],
+    tagged_check: bool,
+) -> Result<Vec<ParsedChapterRewrite>, String> {
+    if let Some(error) = model_output_truncation_error(&output.raw_response) {
+        return Err(error);
+    }
+    let body = parse_rewrite_output_envelope(&output.text, tagged_check)?;
+    parse_batch_rewrite_output(&body, chapters)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5336,6 +5990,90 @@ fn stage_rewrite_shard(
     batch_index: i64,
     rewrites: &[ParsedChapterRewrite],
 ) -> Result<(), String> {
+    stage_rewrite_shard_with_phase(state, novel_id, batch_index, "rewrite", rewrites)
+}
+
+fn staged_draft_for_shard(
+    shard: &[Chapter],
+    staged: &HashMap<String, StagedChapterOutput>,
+) -> Option<Vec<ParsedChapterRewrite>> {
+    shard
+        .iter()
+        .map(|chapter| {
+            let output = staged.get(&chapter.id)?;
+            Some(ParsedChapterRewrite {
+                id: chapter.id.clone(),
+                index: chapter.index,
+                title: output.title.clone()?.trim().to_string(),
+                text: output.content.clone()?.trim().to_string(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .filter(|rewrites| {
+            rewrites
+                .iter()
+                .all(|rewrite| !rewrite.title.is_empty() && !rewrite.text.is_empty())
+        })
+}
+
+fn load_reusable_rewrite_plan(
+    state: &State<'_, AppState>,
+    shard: &[Chapter],
+) -> Result<Option<RewritePlan>, String> {
+    let conn = state.conn.lock().map_err(to_string)?;
+    let mut contract_json: Option<String> = None;
+    for chapter in shard {
+        let record = conn
+            .query_row(
+                "SELECT contract_json, validation_status, rule_pack_version FROM rewrite_contracts WHERE chapter_id = ?1",
+                params![chapter.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(to_string)?;
+        let Some((candidate, status, rule_pack_version)) = record else {
+            return Ok(None);
+        };
+        if !matches!(status.as_str(), "planned" | "failed")
+            || rule_pack_version != PROTAGONIST_RULE_PACK_VERSION
+        {
+            return Ok(None);
+        }
+        if contract_json
+            .as_ref()
+            .is_some_and(|existing| existing != &candidate)
+        {
+            return Ok(None);
+        }
+        contract_json = Some(candidate);
+    }
+    contract_json
+        .map(|json| serde_json::from_str::<RewritePlan>(&json).map_err(to_string))
+        .transpose()
+}
+
+fn stage_rewrite_draft_shard(
+    state: &State<'_, AppState>,
+    novel_id: &str,
+    batch_index: i64,
+    rewrites: &[ParsedChapterRewrite],
+) -> Result<(), String> {
+    stage_rewrite_shard_with_phase(state, novel_id, batch_index, "rewrite_draft", rewrites)
+}
+
+fn stage_rewrite_shard_with_phase(
+    state: &State<'_, AppState>,
+    novel_id: &str,
+    batch_index: i64,
+    phase: &str,
+    rewrites: &[ParsedChapterRewrite],
+) -> Result<(), String> {
     let mut conn = state.conn.lock().map_err(to_string)?;
     let tx = conn.transaction().map_err(to_string)?;
     let now = Utc::now().to_rfc3339();
@@ -5343,7 +6081,7 @@ fn stage_rewrite_shard(
         tx.execute(
             "INSERT INTO auto_run_shard_outputs (
                 novel_id, batch_index, phase, chapter_id, chapter_index, title, content, created_at
-             ) VALUES (?1, ?2, 'rewrite', ?3, ?4, ?5, ?6, ?7)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(novel_id, batch_index, phase, chapter_id) DO UPDATE SET
                 chapter_index = excluded.chapter_index,
                 title = excluded.title,
@@ -5352,6 +6090,7 @@ fn stage_rewrite_shard(
             params![
                 novel_id,
                 batch_index,
+                phase,
                 rewrite.id,
                 rewrite.index,
                 rewrite.title.trim(),
@@ -5430,15 +6169,15 @@ fn mark_chapters_analysis_failed(
 }
 
 #[allow(dead_code)]
-fn merge_analysis_into_canon_assets(conn: &Connection, novel_id: &str) -> rusqlite::Result<()> {
+fn merge_analysis_into_canon_assets(conn: &Connection, novel_id: &str) -> Result<(), String> {
     let mut stmt = conn.prepare(
         "SELECT title, analysis_json FROM chapters WHERE novel_id = ?1 AND analysis_json IS NOT NULL ORDER BY chapter_index",
-    )?;
+    ).map_err(to_string)?;
     let rows = stmt
         .query_map(params![novel_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+        }).map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>().map_err(to_string)?;
     let analyses = rows
         .iter()
         .map(|(title, analysis_json)| format!("## {}\n{}", title, analysis_json))
@@ -5451,42 +6190,62 @@ fn merge_analysis_into_canon_assets(conn: &Connection, novel_id: &str) -> rusqli
         "AI分析汇总",
         &compact_analysis_asset("AI分析汇总", &analyses),
         &now,
-    )?;
+    ).map_err(to_string)?;
     upsert_canon_asset(
         conn,
         novel_id,
         "人物卡",
         &compact_analysis_asset("人物卡", &collect_analysis_field(&rows, "characters")),
         &now,
-    )?;
+    ).map_err(to_string)?;
     upsert_canon_asset(
         conn,
         novel_id,
         "人物关系",
         &compact_analysis_asset("人物关系", &collect_analysis_field(&rows, "relationships")),
         &now,
-    )?;
+    ).map_err(to_string)?;
     upsert_canon_asset(
         conn,
         novel_id,
         "地点",
         &compact_analysis_asset("地点", &collect_analysis_field(&rows, "locations")),
         &now,
-    )?;
+    ).map_err(to_string)?;
     upsert_canon_asset(
         conn,
         novel_id,
         "伏笔",
         &compact_analysis_asset("伏笔", &collect_analysis_field(&rows, "foreshadowing")),
         &now,
-    )?;
+    ).map_err(to_string)?;
     upsert_canon_asset(
         conn,
         novel_id,
         "术语表",
         &compact_analysis_asset("术语表", &collect_analysis_terms(&rows)),
         &now,
-    )?;
+    ).map_err(to_string)?;
+    let chapters = load_chapters(conn, novel_id)?;
+    let mut impact_nodes = Vec::new();
+    for (_, analysis_json) in &rows {
+        for node in parse_impact_nodes_from_analysis(analysis_json, &chapters)? {
+            impact_nodes.push(node);
+        }
+    }
+    let existing_graph = load_canon_asset_content(conn, novel_id, IMPACT_GRAPH_ASSET_KIND)?
+        .map(|content| parse_impact_graph(&content))
+        .unwrap_or_default();
+    let impact_nodes = merge_impact_graph_nodes(&existing_graph, &impact_nodes);
+    let impact_content = serialize_impact_graph(&impact_nodes)?;
+    upsert_canon_asset(
+        conn,
+        novel_id,
+        IMPACT_GRAPH_ASSET_KIND,
+        &impact_content,
+        &now,
+    )
+    .map_err(to_string)?;
     Ok(())
 }
 
@@ -6658,7 +7417,49 @@ fn row_to_chapter(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chapter> {
         single_rewrite_original_available: row.get(8)?,
         analysis_status: row.get(9)?,
         rewrite_status: row.get(10)?,
+        rewrite_validation_status: row.get(11)?,
+        rewrite_obligation_total: row.get::<_, i64>(12)?.max(0) as usize,
+        rewrite_obligation_satisfied: row.get::<_, i64>(13)?.max(0) as usize,
     })
+}
+
+fn pause_auto_run_after_quality_gate(
+    state: &State<'_, AppState>,
+    app: &AppHandle,
+    job: Job,
+    completed_batches: i64,
+    start_batch_index: i64,
+    error: &str,
+) -> Result<Job, String> {
+    let message = format!(
+        "主角主动重构质量门连续三次未通过，任务已暂停；未达标草稿不会写入章节。契约与当前草稿已保留，但该暂停点不会自动继续。仅更换复检模型时可重新验收草稿；修改改写模型、设定、风格或规则后请终止暂停点并启动新任务。\n\n{}",
+        error.trim_start_matches(QUALITY_GATE_PREFIX)
+    );
+    let paused = pause_auto_run_with_kind(
+        state,
+        app,
+        job,
+        completed_batches,
+        start_batch_index,
+        "quality_gate",
+        &message,
+    )?;
+    let control = {
+        let mut runs = state.auto_runs.lock().map_err(to_string)?;
+        let control = runs
+            .get_mut(&paused.novel_id)
+            .ok_or_else(|| "当前一键任务状态不存在。".to_string())?;
+        control.recoverable = false;
+        control.clone()
+    };
+    persist_auto_run_checkpoint(state, &paused.novel_id, &control, &message, None, None)?;
+    let conn = state.conn.lock().map_err(to_string)?;
+    conn.execute(
+        "UPDATE auto_run_checkpoints SET phase = 'rewrite_draft', updated_at = ?1 WHERE novel_id = ?2",
+        params![Utc::now().to_rfc3339(), paused.novel_id],
+    )
+    .map_err(to_string)?;
+    Ok(paused)
 }
 
 fn row_to_chapter_batch(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChapterBatch> {
@@ -7091,6 +7892,9 @@ mod tests {
             single_rewrite_original_available: false,
             analysis_status: "completed".to_string(),
             rewrite_status: "pending".to_string(),
+            rewrite_validation_status: "unvalidated".to_string(),
+            rewrite_obligation_total: 0,
+            rewrite_obligation_satisfied: 0,
         }
     }
 
@@ -7108,6 +7912,66 @@ mod tests {
             relationship_targets: "[]".to_string(),
             updated_at: "now".to_string(),
         }
+    }
+
+    fn sample_rewrite_plan() -> RewritePlan {
+        RewritePlan {
+            plan_version: PROTAGONIST_RULE_PACK_VERSION.to_string(),
+            graph_additions: Vec::new(),
+            obligations: vec![RewriteObligation {
+                obligation_id: "O-1".to_string(),
+                node_id: "impact-1".to_string(),
+                chapter_index: 1,
+                rule_ids: vec!["R3_PROTAGONIST_NODE_DELTA".to_string()],
+                preserve: vec!["主角入场".to_string()],
+                required_changes: vec!["让旁人对她的入场方式产生可见反应".to_string()],
+                deep_delta_categories: vec!["other_reaction".to_string()],
+                forbidden_regressions: Vec::new(),
+                downstream_effects: Vec::new(),
+                planned_state_updates: Vec::new(),
+            }],
+            planned_state_updates: Vec::new(),
+            cross_shard_dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn coverage_review_requires_real_rewrite_evidence_for_every_obligation() {
+        let rewrites = vec![ParsedChapterRewrite {
+            id: "chapter-1".to_string(),
+            index: 1,
+            title: "第一章".to_string(),
+            text: "药老望着萧妍利落推门的动作，先是一怔，随后失笑。".to_string(),
+        }];
+        let valid = r#"{
+          "approved": true,
+          "coverage": [{"obligation_id":"O-1","status":"satisfied","chapter_indexes":[1],"evidence":"药老望着萧妍利落推门的动作，先是一怔"}],
+          "issues": [],
+          "state_updates": []
+        }"#;
+        let parsed = parse_rewrite_review_decision_output(
+            valid,
+            &sample_novel_settings(),
+            &sample_rewrite_plan(),
+            &rewrites,
+        )
+        .unwrap();
+        assert!(parsed.decision.approved);
+
+        let forged = valid.replace("药老望着萧妍利落推门的动作，先是一怔", "正文中不存在的证据");
+        let parsed = parse_rewrite_review_decision_output(
+            &forged,
+            &sample_novel_settings(),
+            &sample_rewrite_plan(),
+            &rewrites,
+        )
+        .unwrap();
+        assert!(!parsed.decision.approved);
+        assert!(parsed
+            .decision
+            .issues
+            .iter()
+            .any(|issue| issue.category == "obligation_coverage"));
     }
 
     #[test]

@@ -13,6 +13,8 @@ type AppSettingsViewProps = {
   onChooseExportDir: () => void;
   onClearExportDir: () => void;
   onToggleReview: () => void;
+  onRewriteStrategyChange?: (strategy: "legacy" | "protagonist_graph_v1") => void;
+  onRewriteCheckModeChange?: (mode: "off" | "tagged") => void;
   onReviewProfileChange: (profileId: string) => void;
   onAnalysisProfileChange: (profileId: string) => void;
   onBatchSizeChange: (value: 10 | 30 | 50 | 100) => void;
@@ -22,8 +24,9 @@ type AppSettingsViewProps = {
 };
 
 export function AppSettingsView(props: AppSettingsViewProps) {
-  const { settings, profiles, busy, processing, autoContinueSettingBusy, allowPausedTaskAdjustments = false, onBack, onChooseExportDir, onClearExportDir, onToggleReview, onReviewProfileChange, onAnalysisProfileChange, onBatchSizeChange, onParallelismChange, onToggleAutoContinue, onDeleteLocalData } = props;
+  const { settings, profiles, busy, processing, autoContinueSettingBusy, allowPausedTaskAdjustments = false, onBack, onChooseExportDir, onClearExportDir, onToggleReview, onRewriteStrategyChange = () => undefined, onRewriteCheckModeChange = () => undefined, onReviewProfileChange, onAnalysisProfileChange, onBatchSizeChange, onParallelismChange, onToggleAutoContinue, onDeleteLocalData } = props;
   const adjustmentDisabled = processing && !allowPausedTaskAdjustments;
+  const graphStrategy = (settings.rewrite_strategy ?? "protagonist_graph_v1") === "protagonist_graph_v1";
   const batchSize = settings.chapter_batch_size ?? 30;
   const maxParallelism = batchSize === 100 ? 50 : batchSize === 50 ? 25 : 10;
   return (
@@ -35,6 +38,23 @@ export function AppSettingsView(props: AppSettingsViewProps) {
           <input readOnly value={settings.export_dir || "默认应用数据目录"} />
           <button onClick={onChooseExportDir} disabled={busy === "choose-export-dir" || processing}><FolderOpen size={16} />选择目录</button>
           <button onClick={onClearExportDir} disabled={!settings.export_dir || busy === "clear-export-dir" || processing}>恢复默认</button>
+        </div>
+      </section>
+      <section className="settings-section">
+        <div className="settings-section-heading">
+          <h3>改写策略</h3>
+          <span className="setting-help" tabIndex={0} aria-label="主角主动重构说明"><HelpCircle size={16} /><span className="setting-help-tooltip" role="tooltip">主角主动重构会先建立原著影响图和分片契约，再逐义务生成、复检和定向修复。姓名、代词、称谓或外貌替换不能单独通过质量门。</span></span>
+        </div>
+        <div className="setting-toggle-row">
+          <div className="mode-toggle" role="radiogroup" aria-label="改写策略">
+            <button type="button" role="radio" aria-checked={graphStrategy} className={graphStrategy ? "active" : ""} disabled={busy === "rewrite-strategy-setting" || processing} onClick={() => onRewriteStrategyChange("protagonist_graph_v1")}>主角主动重构</button>
+            <button type="button" role="radio" aria-checked={!graphStrategy} className={!graphStrategy ? "active" : ""} disabled={busy === "rewrite-strategy-setting" || processing} onClick={() => onRewriteStrategyChange("legacy")}>旧版兼容</button>
+          </div>
+          <span>{graphStrategy ? "默认模式：规划、正文、覆盖复检全部通过后才保存。" : "使用原核心设定和旧改写流程。"}</span>
+        </div>
+        <div className="setting-toggle-row">
+          <button className={settings.rewrite_check_mode === "tagged" ? "setting-switch active" : "setting-switch"} type="button" aria-pressed={settings.rewrite_check_mode === "tagged"} disabled={!graphStrategy || busy === "rewrite-check-setting" || adjustmentDisabled} onClick={() => onRewriteCheckModeChange(settings.rewrite_check_mode === "tagged" ? "off" : "tagged")}>{settings.rewrite_check_mode === "tagged" ? "开启" : "关闭"}</button>
+          <span>高级短自检：开启后正文和修复模型使用严格标签包装；默认关闭。</span>
         </div>
       </section>
       <section className="settings-section">
@@ -78,8 +98,8 @@ export function AppSettingsView(props: AppSettingsViewProps) {
           <span className="setting-help" tabIndex={0} aria-label="改写复检说明"><HelpCircle size={16} /><span className="setting-help-tooltip" role="tooltip">双专家审查会显著增加请求数和等待时间，但能让改写后的文本逻辑更顺、质量更稳。开启后，每个分片最多可能经历“分析、初稿改写、审查判定、打回重写、审查复判、再次打回重写、第三次审查”七次模型请求。建议为审查专家选择逻辑能力强、JSON 输出稳定、长文本一致性检查更可靠的模型。</span></span>
         </div>
         <div className="setting-toggle-row">
-          <button className={settings.review_enabled ? "setting-switch active" : "setting-switch"} onClick={onToggleReview} disabled={busy === "review-setting" || adjustmentDisabled} title="开启复检时AI改写完成后会检查一遍是否有疏漏，会增加改写时间">{settings.review_enabled ? "开启" : "关闭"}</button>
-          <span>默认开启，每批改写会由审查专家判定；不通过时打回改写模型重写并复判。优先速度时可关闭。</span>
+          <button className={settings.review_enabled ? "setting-switch active" : "setting-switch"} onClick={onToggleReview} disabled={graphStrategy || busy === "review-setting" || adjustmentDisabled} title={graphStrategy ? "主角主动重构必须执行覆盖复检" : "开启复检时AI改写完成后会检查一遍是否有疏漏，会增加改写时间"}>{settings.review_enabled ? "开启" : "关闭"}</button>
+          <span>{graphStrategy ? "主角主动重构强制开启复检；全部义务通过前不会保存改写稿。" : "旧版模式可按速度需要关闭复检。"}</span>
         </div>
         <div className="setting-row">
           <select value={settings.review_profile_id ?? ""} onChange={(event) => onReviewProfileChange(event.target.value)} disabled={busy === "review-profile-setting" || adjustmentDisabled} title="选择第二个 AI 作为审查专家；留空则使用当前改写模型审查">

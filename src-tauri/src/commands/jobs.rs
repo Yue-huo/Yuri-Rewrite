@@ -96,7 +96,9 @@ fn build_auto_run_recovery_summary(
     phase: Option<String>,
     batch_index: Option<i64>,
 ) -> Result<Option<AutoRunRecoverySummary>, String> {
-    let Some(phase) = phase.filter(|value| matches!(value.as_str(), "analysis" | "rewrite")) else {
+    let Some(phase) = phase.filter(|value| {
+        matches!(value.as_str(), "analysis" | "rewrite" | "rewrite_draft")
+    }) else {
         return Ok(None);
     };
     let Some(batch_index) = batch_index else {

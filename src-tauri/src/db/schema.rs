@@ -142,6 +142,23 @@ pub(crate) fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS rewrite_contracts (
+            chapter_id TEXT PRIMARY KEY,
+            novel_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            batch_index INTEGER,
+            plan_fingerprint TEXT NOT NULL,
+            rule_pack_version TEXT NOT NULL,
+            contract_json TEXT NOT NULL,
+            coverage_json TEXT,
+            validation_status TEXT NOT NULL DEFAULT 'planned',
+            obligation_total INTEGER NOT NULL DEFAULT 0,
+            obligation_satisfied INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(chapter_id) REFERENCES chapters(id) ON DELETE CASCADE,
+            FOREIGN KEY(novel_id) REFERENCES novels(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS auto_run_checkpoints (
             novel_id TEXT PRIMARY KEY,
             start_batch_index INTEGER NOT NULL,
@@ -183,6 +200,8 @@ pub(crate) fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_chapter_batches_novel ON chapter_batches(novel_id, batch_index);
         CREATE INDEX IF NOT EXISTS idx_auto_run_shard_outputs_phase
             ON auto_run_shard_outputs(novel_id, batch_index, phase, chapter_index);
+        CREATE INDEX IF NOT EXISTS idx_rewrite_contracts_novel
+            ON rewrite_contracts(novel_id, validation_status, updated_at);
         "#,
     )?;
     migrations::ensure_column(conn, "model_profiles", "api_key", "TEXT")?;
@@ -757,5 +776,32 @@ mod tests {
             })
             .expect("count checkpoints");
         assert_eq!(checkpoint_count, 0);
+    }
+
+    #[test]
+    fn deleting_novel_cascades_rewrite_contracts() {
+        let conn = Connection::open_in_memory().expect("open database");
+        init_db(&conn).expect("initialize schema");
+        conn.execute(
+            "INSERT INTO novels (id, title, source_path, encoding, status, created_at) VALUES ('novel-1', '测试', 'a.txt', 'UTF-8', 'imported', 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chapters (id, novel_id, chapter_index, title, original_text, analysis_status, rewrite_status) VALUES ('chapter-1', 'novel-1', 1, '第一章', '原文', 'completed', 'pending')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rewrite_contracts (chapter_id, novel_id, run_id, plan_fingerprint, rule_pack_version, contract_json, coverage_json, validation_status, obligation_total, obligation_satisfied, updated_at) VALUES ('chapter-1', 'novel-1', 'run-1', 'fp', 'protagonist-graph-v1', '{}', '[]', 'planned', 1, 0, 'now')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM novels WHERE id = 'novel-1'", [])
+            .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM rewrite_contracts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

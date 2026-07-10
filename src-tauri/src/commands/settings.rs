@@ -1,8 +1,9 @@
 use crate::domain::{AppSettings, AppState, ChapterBatch, NovelSettings};
 use crate::task_control::{auto_runs_are_only_paused, auto_runs_have_non_paused};
 use crate::{
-    load_chapters, load_novel_settings, normalize_additional_feminize_names,
-    normalize_relationship_targets, to_string,
+    load_chapters, load_novel_settings,
+    normalize_additional_feminize_names, normalize_relationship_targets,
+    normalize_rewrite_check_mode, normalize_rewrite_strategy, to_string,
 };
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -24,7 +25,12 @@ pub(crate) fn get_app_settings(state: State<AppState>) -> Result<AppSettings, St
         )
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let review_enabled = load_review_enabled(&conn)?;
+    let rewrite_strategy = load_rewrite_strategy(&conn)?;
+    let review_enabled = if rewrite_strategy == "protagonist_graph_v1" {
+        true
+    } else {
+        load_review_enabled(&conn)?
+    };
     let review_profile_id = load_review_profile_id(&conn)?;
     let analysis_profile_id = load_analysis_profile_id(&conn)?;
     let selected_profile_id = load_selected_profile_id(&conn)?;
@@ -32,6 +38,7 @@ pub(crate) fn get_app_settings(state: State<AppState>) -> Result<AppSettings, St
     let rewrite_parallelism = load_rewrite_parallelism(&conn)?;
     let auto_continue_enabled = load_auto_continue_enabled(&conn)?;
     let core_prompt = load_core_prompt(&conn)?;
+    let (style_prompt, style_prompt_needs_review) = load_style_prompt(&conn)?;
     Ok(AppSettings {
         export_dir,
         core_prompt,
@@ -42,6 +49,10 @@ pub(crate) fn get_app_settings(state: State<AppState>) -> Result<AppSettings, St
         chapter_batch_size,
         rewrite_parallelism,
         auto_continue_enabled,
+        rewrite_strategy,
+        style_prompt,
+        rewrite_check_mode: load_rewrite_check_mode(&conn)?,
+        style_prompt_needs_review,
     })
 }
 
@@ -65,11 +76,16 @@ pub(crate) fn save_app_settings(
     }
     let paused_auto_run = auto_runs_are_only_paused(&state.auto_runs)?;
     let mut conn = state.conn.lock().map_err(to_string)?;
+    let current_settings = load_app_settings(&conn)?;
     let current_batch_size = load_chapter_batch_size(&conn)?;
     let chapter_batch_size = normalize_chapter_batch_size(settings.chapter_batch_size);
     if paused_auto_run {
         let current = load_app_settings(&conn)?;
-        if current.export_dir != settings.export_dir || current.core_prompt != settings.core_prompt
+        if current.export_dir != settings.export_dir
+            || current.core_prompt != settings.core_prompt
+            || current.style_prompt != settings.style_prompt
+            || current.rewrite_strategy != settings.rewrite_strategy
+            || current.rewrite_check_mode != settings.rewrite_check_mode
         {
             return Err(
                 "一键任务暂停中只能修改并发、复检和模型选择，不能修改导出目录或全局核心设定。"
@@ -91,21 +107,47 @@ pub(crate) fn save_app_settings(
     }
     let rewrite_parallelism =
         clamp_parallelism_for_batch_size(settings.rewrite_parallelism, chapter_batch_size);
+    let rewrite_strategy = normalize_rewrite_strategy(&settings.rewrite_strategy);
     let normalized = AppSettings {
         export_dir,
         core_prompt: settings.core_prompt.trim().to_string(),
-        review_enabled: settings.review_enabled,
+        review_enabled: if rewrite_strategy == "protagonist_graph_v1" {
+            true
+        } else {
+            settings.review_enabled
+        },
         review_profile_id: normalize_review_profile_id(settings.review_profile_id.as_deref()),
         analysis_profile_id: normalize_analysis_profile_id(settings.analysis_profile_id.as_deref()),
         selected_profile_id: normalize_profile_id(settings.selected_profile_id.as_deref()),
         chapter_batch_size,
         rewrite_parallelism,
         auto_continue_enabled: settings.auto_continue_enabled,
+        rewrite_strategy,
+        style_prompt: settings.style_prompt.trim().to_string(),
+        rewrite_check_mode: normalize_rewrite_check_mode(&settings.rewrite_check_mode),
+        style_prompt_needs_review: settings.style_prompt_needs_review
+            && settings.style_prompt.trim() == current_settings.style_prompt,
     };
     if chapter_batch_size != current_batch_size {
         rebuild_detected_chapter_batches_and_save(&mut conn, &state.data_dir, &normalized)?;
     } else {
         save_app_settings_values(&conn, &normalized)?;
+    }
+    if current_settings.rewrite_strategy != normalized.rewrite_strategy
+        || current_settings.style_prompt != normalized.style_prompt
+        || current_settings.rewrite_check_mode != normalized.rewrite_check_mode
+        || current_settings.selected_profile_id != normalized.selected_profile_id
+    {
+        conn.execute(
+            "UPDATE rewrite_contracts SET validation_status = 'stale', updated_at = ?1",
+            params![Utc::now().to_rfc3339()],
+        )
+        .map_err(to_string)?;
+        conn.execute(
+            "DELETE FROM auto_run_shard_outputs WHERE phase = 'rewrite_draft'",
+            [],
+        )
+        .map_err(to_string)?;
     }
     Ok(normalized)
 }
@@ -119,16 +161,26 @@ fn load_app_settings(conn: &Connection) -> Result<AppSettings, String> {
         )
         .ok()
         .filter(|value| !value.trim().is_empty());
+    let rewrite_strategy = load_rewrite_strategy(conn)?;
+    let (style_prompt, style_prompt_needs_review) = load_style_prompt(conn)?;
     Ok(AppSettings {
         export_dir,
         core_prompt: load_core_prompt(conn)?,
-        review_enabled: load_review_enabled(conn)?,
+        review_enabled: if rewrite_strategy == "protagonist_graph_v1" {
+            true
+        } else {
+            load_review_enabled(conn)?
+        },
         review_profile_id: load_review_profile_id(conn)?,
         analysis_profile_id: load_analysis_profile_id(conn)?,
         selected_profile_id: load_selected_profile_id(conn)?,
         chapter_batch_size: load_chapter_batch_size(conn)?,
         rewrite_parallelism: load_rewrite_parallelism(conn)?,
         auto_continue_enabled: load_auto_continue_enabled(conn)?,
+        rewrite_strategy,
+        style_prompt,
+        rewrite_check_mode: load_rewrite_check_mode(conn)?,
+        style_prompt_needs_review,
     })
 }
 
@@ -150,7 +202,103 @@ fn save_app_settings_values(conn: &Connection, settings: &AppSettings) -> Result
     save_review_profile_id(conn, settings.review_profile_id.as_deref())?;
     save_analysis_profile_id(conn, settings.analysis_profile_id.as_deref())?;
     save_selected_profile_id_value(conn, settings.selected_profile_id.as_deref())?;
-    save_core_prompt(conn, &settings.core_prompt)
+    save_core_prompt(conn, &settings.core_prompt)?;
+    save_string_setting(conn, "rewrite_strategy", &settings.rewrite_strategy)?;
+    save_string_setting(conn, "rewrite_check_mode", &settings.rewrite_check_mode)?;
+    save_string_setting(conn, "style_prompt", &settings.style_prompt)?;
+    save_bool_setting(conn, "style_prompt_migration_v1", true)?;
+    save_bool_setting(
+        conn,
+        "style_prompt_needs_review",
+        settings.style_prompt_needs_review,
+    )
+}
+
+pub(crate) fn load_rewrite_strategy(conn: &Connection) -> Result<String, String> {
+    Ok(normalize_rewrite_strategy(
+        &load_string_setting(conn, "rewrite_strategy")?.unwrap_or_default(),
+    ))
+}
+
+pub(crate) fn load_rewrite_check_mode(conn: &Connection) -> Result<String, String> {
+    Ok(normalize_rewrite_check_mode(
+        &load_string_setting(conn, "rewrite_check_mode")?.unwrap_or_default(),
+    ))
+}
+
+pub(crate) fn load_style_prompt(conn: &Connection) -> Result<(String, bool), String> {
+    let migrated = load_bool_setting(conn, "style_prompt_migration_v1")?.unwrap_or(false);
+    if migrated {
+        return Ok((
+            load_string_setting(conn, "style_prompt")?.unwrap_or_default(),
+            load_bool_setting(conn, "style_prompt_needs_review")?.unwrap_or(false),
+        ));
+    }
+
+    let core_prompt = load_core_prompt(conn)?;
+    let (style_prompt, needs_review) = match extract_style_prompt(&core_prompt) {
+        Some(extracted) => (extracted, false),
+        None if core_prompt.trim().is_empty() => (String::new(), false),
+        None => (core_prompt.clone(), true),
+    };
+    save_string_setting(conn, "style_prompt", &style_prompt)?;
+    save_bool_setting(conn, "style_prompt_needs_review", needs_review)?;
+    save_bool_setting(conn, "style_prompt_migration_v1", true)?;
+    Ok((style_prompt, needs_review))
+}
+
+fn extract_style_prompt(core_prompt: &str) -> Option<String> {
+    let start_markers = ["## 二、行文与叙事文风规则", "二、行文与叙事文风规则"];
+    let end_markers = [
+        "## 三、行为、动作与互动调整规则",
+        "三、行为、动作与互动调整规则",
+    ];
+    let start = start_markers
+        .iter()
+        .filter_map(|marker| core_prompt.find(marker).map(|index| (index, marker.len())))
+        .min_by_key(|(index, _)| *index)?;
+    let body_start = start.0 + start.1;
+    let relative_end = end_markers
+        .iter()
+        .filter_map(|marker| core_prompt[body_start..].find(marker))
+        .min()?;
+    let body = core_prompt[body_start..body_start + relative_end].trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
+fn load_string_setting(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(to_string)
+}
+
+fn save_string_setting(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        conn.execute("DELETE FROM app_settings WHERE key = ?1", params![key])
+            .map_err(to_string)?;
+    } else {
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map_err(to_string)?;
+    }
+    Ok(())
+}
+
+fn load_bool_setting(conn: &Connection, key: &str) -> Result<Option<bool>, String> {
+    Ok(load_string_setting(conn, key)?.map(|value| {
+        matches!(value.trim(), "true" | "1" | "yes")
+    }))
+}
+
+fn save_bool_setting(conn: &Connection, key: &str, value: bool) -> Result<(), String> {
+    save_string_setting(conn, key, if value { "true" } else { "false" })
 }
 
 struct PreparedNovelBatches {
@@ -703,6 +851,21 @@ pub(crate) fn save_novel_settings(
         ],
     )
     .map_err(to_string)?;
+    conn.execute(
+        "UPDATE rewrite_contracts SET validation_status = 'stale', updated_at = ?1 WHERE novel_id = ?2",
+        params![Utc::now().to_rfc3339(), novel_id],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "DELETE FROM auto_run_shard_outputs WHERE novel_id = ?1 AND phase = 'rewrite_draft'",
+        params![novel_id],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "DELETE FROM canon_assets WHERE novel_id = ?1 AND kind = '主角性别影响图'",
+        params![novel_id],
+    )
+    .map_err(to_string)?;
     Ok(settings)
 }
 
@@ -737,6 +900,10 @@ mod tests {
             chapter_batch_size: batch_size,
             rewrite_parallelism: parallelism,
             auto_continue_enabled: false,
+            rewrite_strategy: "protagonist_graph_v1".to_string(),
+            style_prompt: String::new(),
+            rewrite_check_mode: "off".to_string(),
+            style_prompt_needs_review: false,
         }
     }
 
@@ -746,6 +913,28 @@ mod tests {
             normalize_protagonist_aliases("炎儿 -> 小妍儿，岩枭\n炎儿；萧炎 -> 萧妍", "萧炎"),
             "炎儿 -> 小妍儿\n岩枭"
         );
+    }
+
+    #[test]
+    fn style_prompt_migration_extracts_style_section_and_preserves_core_prompt() {
+        let conn = Connection::open_in_memory().expect("open database");
+        init_db(&conn).expect("initialize schema");
+        let original = "一、总则\n保留剧情\n二、行文与叙事文风规则\n句子轻快。\n对白自然。\n三、行为、动作与互动调整规则\n重构互动";
+        save_core_prompt(&conn, original).unwrap();
+        let (style, needs_review) = load_style_prompt(&conn).unwrap();
+        assert_eq!(style, "句子轻快。\n对白自然。");
+        assert!(!needs_review);
+        assert_eq!(load_core_prompt(&conn).unwrap(), original);
+    }
+
+    #[test]
+    fn style_prompt_migration_falls_back_without_losing_content() {
+        let conn = Connection::open_in_memory().expect("open database");
+        init_db(&conn).expect("initialize schema");
+        save_core_prompt(&conn, "无法拆分的个人提示词").unwrap();
+        let (style, needs_review) = load_style_prompt(&conn).unwrap();
+        assert_eq!(style, "无法拆分的个人提示词");
+        assert!(needs_review);
     }
 
     #[test]

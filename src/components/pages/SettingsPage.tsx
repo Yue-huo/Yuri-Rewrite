@@ -12,6 +12,8 @@ type SettingsPageProps = {
   onChooseExportDir: () => void;
   onClearExportDir: () => void;
   onToggleReview: () => void;
+  onRewriteStrategyChange?: (strategy: "legacy" | "protagonist_graph_v1") => void;
+  onRewriteCheckModeChange?: (mode: "off" | "tagged") => void;
   onReviewProfileChange: (profileId: string) => void;
   onAnalysisProfileChange: (profileId: string) => void;
   onBatchSizeChange: (value: 10 | 30 | 50 | 100) => void;
@@ -33,6 +35,8 @@ export function SettingsPage(props: SettingsPageProps) {
       onChooseExportDir={props.onChooseExportDir}
       onClearExportDir={props.onClearExportDir}
       onToggleReview={props.onToggleReview}
+      onRewriteStrategyChange={props.onRewriteStrategyChange}
+      onRewriteCheckModeChange={props.onRewriteCheckModeChange}
       onReviewProfileChange={props.onReviewProfileChange}
       onAnalysisProfileChange={props.onAnalysisProfileChange}
       onBatchSizeChange={props.onBatchSizeChange}

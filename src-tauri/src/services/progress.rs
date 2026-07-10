@@ -8,6 +8,7 @@ use tauri::{Emitter, State};
 fn phase_label(phase: &str) -> &'static str {
     match phase {
         "analysis" => "分析",
+        "planning" => "规划",
         "rewrite" => "改写",
         "review" => "审查",
         "revision" => "修复",

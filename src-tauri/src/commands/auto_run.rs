@@ -6,12 +6,15 @@ use crate::{
     emit_job_progress, finish_stopped_auto_run, load_analysis_profile_for_run,
     load_analysis_profile_id, load_chapter_batches, load_chapters_for_batch, load_job,
     load_model_profile, load_review_enabled, load_review_profile_for_run, load_review_profile_id,
+    load_rewrite_strategy, graph_strategy_name_enabled,
     pause_auto_run_after_content_filter, pause_auto_run_after_model_format_error,
+    pause_auto_run_after_quality_gate,
     pause_auto_run_after_network_error, pause_auto_run_after_rate_limit,
     pause_auto_run_after_temporary_gateway_error, prepare_auto_run, read_stored_api_key,
     register_auto_run_job, request_auto_run_stop, requested_auto_run_stop, require_novel_settings,
     rewrite_chapters_for_auto, row_to_novel, set_auto_run_completed, to_string,
     update_auto_run_checkpoint_phase, update_job, AUTO_RUN_PAUSED, AUTO_RUN_TERMINATED,
+    QUALITY_GATE_PREFIX,
 };
 use crate::{
     is_content_filter_error, is_recoverable_model_format_error, is_recoverable_network_error,
@@ -23,6 +26,7 @@ use tauri::{AppHandle, State};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoverableAutoRunFailure {
+    QualityGate,
     ContentFilter,
     RateLimit,
     TemporaryGateway,
@@ -78,6 +82,14 @@ fn pause_auto_run_after_recoverable_failure(
     error: &str,
 ) -> Result<Job, String> {
     match kind {
+        RecoverableAutoRunFailure::QualityGate => pause_auto_run_after_quality_gate(
+            state,
+            app,
+            job,
+            completed_batches,
+            start_batch_index,
+            error,
+        ),
         RecoverableAutoRunFailure::ContentFilter => pause_auto_run_after_content_filter(
             state,
             app,
@@ -144,7 +156,8 @@ pub(crate) async fn start_analyze_rewrite_batch(
         (
             batch,
             chapters,
-            load_review_enabled(&conn)?,
+            graph_strategy_name_enabled(&load_rewrite_strategy(&conn)?)
+                || load_review_enabled(&conn)?,
             load_review_profile_id(&conn)?,
             load_analysis_profile_id(&conn)?,
         )
@@ -308,7 +321,9 @@ pub(crate) async fn start_analyze_rewrite_batch(
 }
 
 fn classify_recoverable_auto_run_failure(error: &str) -> Option<RecoverableAutoRunFailure> {
-    if is_content_filter_error(error) {
+    if error.starts_with(QUALITY_GATE_PREFIX) || error.contains(QUALITY_GATE_PREFIX) {
+        Some(RecoverableAutoRunFailure::QualityGate)
+    } else if is_content_filter_error(error) {
         Some(RecoverableAutoRunFailure::ContentFilter)
     } else if is_rate_limit_retry_exhausted(error) {
         Some(RecoverableAutoRunFailure::RateLimit)
@@ -346,7 +361,8 @@ pub(crate) async fn start_analyze_rewrite_all(
         (
             novel,
             load_chapter_batches(&conn, &novel_id)?,
-            load_review_enabled(&conn)?,
+            graph_strategy_name_enabled(&load_rewrite_strategy(&conn)?)
+                || load_review_enabled(&conn)?,
             load_review_profile_id(&conn)?,
             load_analysis_profile_id(&conn)?,
         )
@@ -694,5 +710,15 @@ mod tests {
                 Some(RecoverableAutoRunFailure::ContentFilter)
             );
         }
+    }
+
+    #[test]
+    fn quality_gate_has_dedicated_non_automatic_pause_reason() {
+        assert_eq!(
+            classify_recoverable_auto_run_failure(
+                "第1章：__YURI_QUALITY_GATE__:第三次覆盖审查未通过"
+            ),
+            Some(RecoverableAutoRunFailure::QualityGate)
+        );
     }
 }

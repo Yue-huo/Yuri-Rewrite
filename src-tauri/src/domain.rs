@@ -46,6 +46,16 @@ pub(crate) struct Chapter {
     pub(crate) single_rewrite_original_available: bool,
     pub(crate) analysis_status: String,
     pub(crate) rewrite_status: String,
+    #[serde(default = "default_rewrite_validation_status")]
+    pub(crate) rewrite_validation_status: String,
+    #[serde(default)]
+    pub(crate) rewrite_obligation_total: usize,
+    #[serde(default)]
+    pub(crate) rewrite_obligation_satisfied: usize,
+}
+
+fn default_rewrite_validation_status() -> String {
+    "unvalidated".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -297,6 +307,22 @@ pub(crate) struct AppSettings {
     pub(crate) rewrite_parallelism: usize,
     #[serde(default)]
     pub(crate) auto_continue_enabled: bool,
+    #[serde(default = "default_rewrite_strategy")]
+    pub(crate) rewrite_strategy: String,
+    #[serde(default)]
+    pub(crate) style_prompt: String,
+    #[serde(default = "default_rewrite_check_mode")]
+    pub(crate) rewrite_check_mode: String,
+    #[serde(default)]
+    pub(crate) style_prompt_needs_review: bool,
+}
+
+fn default_rewrite_strategy() -> String {
+    "protagonist_graph_v1".to_string()
+}
+
+fn default_rewrite_check_mode() -> String {
+    "off".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -392,6 +418,11 @@ pub(crate) struct JobEstimate {
     pub(crate) recent_failed_calls: usize,
     pub(crate) average_input_chars: Option<usize>,
     pub(crate) average_output_chars: Option<usize>,
+    pub(crate) analysis_requests: usize,
+    pub(crate) planning_requests: usize,
+    pub(crate) rewrite_requests: usize,
+    pub(crate) review_requests: usize,
+    pub(crate) repair_requests_max: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -489,8 +520,106 @@ pub(crate) struct ReviewIssue {
     pub(crate) required_fix: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub(crate) struct SourceImpactLink {
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) target: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub(crate) struct SourceImpactNode {
+    #[serde(default)]
+    pub(crate) node_id: String,
+    #[serde(default)]
+    pub(crate) chapter_id: String,
+    pub(crate) chapter_index: i64,
+    #[serde(default)]
+    pub(crate) ordinal: usize,
+    pub(crate) presence_kind: String,
+    #[serde(default)]
+    pub(crate) participants: Vec<String>,
+    pub(crate) source_evidence: String,
+    pub(crate) narrative_function: String,
+    #[serde(default)]
+    pub(crate) gender_mechanisms: Vec<String>,
+    #[serde(default)]
+    pub(crate) state_before: String,
+    #[serde(default)]
+    pub(crate) state_after: String,
+    #[serde(default)]
+    pub(crate) thread_keys: Vec<String>,
+    #[serde(default)]
+    pub(crate) links: Vec<SourceImpactLink>,
+    #[serde(default)]
+    pub(crate) confidence: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub(crate) struct RewriteStateUpdate {
+    pub(crate) thread_key: String,
+    pub(crate) state_type: String,
+    pub(crate) value: String,
+    #[serde(default)]
+    pub(crate) chapter_index: i64,
+    #[serde(default)]
+    pub(crate) source_obligation_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub(crate) struct RewriteObligation {
+    pub(crate) obligation_id: String,
+    pub(crate) node_id: String,
+    pub(crate) chapter_index: i64,
+    #[serde(default)]
+    pub(crate) rule_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) preserve: Vec<String>,
+    #[serde(default)]
+    pub(crate) required_changes: Vec<String>,
+    #[serde(default)]
+    pub(crate) deep_delta_categories: Vec<String>,
+    #[serde(default)]
+    pub(crate) forbidden_regressions: Vec<String>,
+    #[serde(default)]
+    pub(crate) downstream_effects: Vec<String>,
+    #[serde(default)]
+    pub(crate) planned_state_updates: Vec<RewriteStateUpdate>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub(crate) struct RewritePlan {
+    pub(crate) plan_version: String,
+    #[serde(default)]
+    pub(crate) graph_additions: Vec<SourceImpactNode>,
+    #[serde(default)]
+    pub(crate) obligations: Vec<RewriteObligation>,
+    #[serde(default)]
+    pub(crate) planned_state_updates: Vec<RewriteStateUpdate>,
+    #[serde(default)]
+    pub(crate) cross_shard_dependencies: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub(crate) struct ReviewCoverageItem {
+    pub(crate) obligation_id: String,
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) chapter_indexes: Vec<i64>,
+    #[serde(default)]
+    pub(crate) evidence: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReviewDecision {
     pub(crate) approved: bool,
     pub(crate) issues: Vec<ReviewIssue>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RewriteReviewDecision {
+    pub(crate) decision: ReviewDecision,
+    pub(crate) coverage: Vec<ReviewCoverageItem>,
+    pub(crate) state_updates: Vec<RewriteStateUpdate>,
 }

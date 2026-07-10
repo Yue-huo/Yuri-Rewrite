@@ -51,7 +51,10 @@ let chapters: Chapter[] = chapterTitles.map((title, offset) => {
     rewrite_edited: false,
     single_rewrite_original_available: false,
     analysis_status: completed ? "completed" : "pending",
-    rewrite_status: completed ? "completed" : "pending"
+    rewrite_status: completed ? "completed" : "pending",
+    rewrite_validation_status: completed ? "passed" : "unvalidated",
+    rewrite_obligation_total: completed ? 3 : 0,
+    rewrite_obligation_satisfied: completed ? 3 : 0
   };
 });
 
@@ -66,7 +69,11 @@ let settings: AppSettings = {
   selected_profile_id: "browser-profile-deepseek",
   chapter_batch_size: 10,
   rewrite_parallelism: 10,
-  auto_continue_enabled: false
+  auto_continue_enabled: false,
+  rewrite_strategy: "protagonist_graph_v1",
+  style_prompt: "保持人物关系、世界观和剧情连续性。",
+  rewrite_check_mode: "off",
+  style_prompt_needs_review: false
 };
 
 let profiles: ModelProfile[] = [
@@ -261,6 +268,11 @@ function estimate(): JobEstimate {
     review_enabled: settings.review_enabled ?? true,
     current_batch_requests: settings.review_enabled ? 70 : 20,
     full_run_requests: settings.review_enabled ? 140 : 40,
+    analysis_requests: 10,
+    planning_requests: settings.rewrite_strategy === "legacy" ? 0 : 10,
+    rewrite_requests: 10,
+    review_requests: settings.review_enabled ? 30 : 0,
+    repair_requests_max: settings.review_enabled ? 20 : 0,
     average_call_seconds: 52,
     estimated_current_batch_seconds: settings.review_enabled ? 364 : 104,
     estimated_full_run_seconds: settings.review_enabled ? 728 : 208,
@@ -361,7 +373,11 @@ export async function invokeBrowserMock(
         selected_profile_id: null,
         chapter_batch_size: 30,
         rewrite_parallelism: 10,
-        auto_continue_enabled: false
+        auto_continue_enabled: false,
+        rewrite_strategy: "protagonist_graph_v1",
+        style_prompt: "",
+        rewrite_check_mode: "off",
+        style_prompt_needs_review: false
       };
       canonAssets = [];
       chapterRule = null;

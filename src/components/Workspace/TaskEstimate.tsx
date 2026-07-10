@@ -33,6 +33,7 @@ export const TaskEstimate = memo(function TaskEstimate({ estimate, collapsed, on
           <div><span>全文规模</span><strong>{formatNumber(estimate.novel_chapters)} 章 · {formatNumber(estimate.novel_chars)} 字 · {formatNumber(estimate.novel_batches)} 批</strong></div>
           <div><span>当前批次</span><strong>{formatNumber(estimate.selected_batch_chapters)} 章 · {formatNumber(estimate.selected_batch_chars)} 字</strong></div>
           <div><span>预计请求数</span><strong>当前 {formatNumber(estimate.current_batch_requests)} · 全文 {formatNumber(estimate.full_run_requests)}</strong></div>
+          <div><span>当前请求构成</span><strong>分析 {formatNumber(estimate.analysis_requests)} · 规划 {formatNumber(estimate.planning_requests)} · 正文 {formatNumber(estimate.rewrite_requests)} · 复检 {formatNumber(estimate.review_requests)} · 最多修复 {formatNumber(estimate.repair_requests_max)}</strong></div>
           <div><span>预计等待</span><strong>当前 {formatSeconds(estimate.estimated_current_batch_seconds)} · 全文 {formatSeconds(estimate.estimated_full_run_seconds)}</strong></div>
           <div><span>历史调用</span><strong>成功 {formatNumber(estimate.recent_success_calls)} · 失败 {formatNumber(estimate.recent_failed_calls)} · 平均 {formatSeconds(estimate.average_call_seconds)}</strong></div>
           <div><span>历史字符</span><strong>输入 {formatNumber(estimate.average_input_chars)} · 输出 {formatNumber(estimate.average_output_chars)}</strong></div>

@@ -19,6 +19,9 @@ export type Chapter = {
   single_rewrite_original_available?: boolean;
   analysis_status: string;
   rewrite_status: string;
+  rewrite_validation_status?: "unvalidated" | "planned" | "passed" | "stale" | "failed";
+  rewrite_obligation_total?: number;
+  rewrite_obligation_satisfied?: number;
 };
 
 export type CanonAsset = {
@@ -135,7 +138,7 @@ export type Job = {
   current_chapter: number;
   total_chapters: number;
   message: string;
-  phase?: "analysis" | "rewrite" | "review" | "revision" | "final_review" | "export";
+  phase?: "analysis" | "planning" | "rewrite" | "review" | "revision" | "final_review" | "export";
   batch_index?: number;
   batch_total?: number;
   batch_label?: string;
@@ -152,7 +155,7 @@ export type ActiveShardProgress = {
   total: number;
   start_chapter: number;
   end_chapter: number;
-  phase: "analysis" | "rewrite" | "review" | "revision" | "final_review" | "export";
+  phase: "analysis" | "planning" | "rewrite" | "review" | "revision" | "final_review" | "export";
 };
 
 export type AutoRunRecovery = {
@@ -176,6 +179,7 @@ export type AutoRunPauseKind =
   | "temporary_gateway"
   | "model_format"
   | "content_filter"
+  | "quality_gate"
   | "interrupted"
   | "unknown"
   | "";
@@ -221,6 +225,10 @@ export type AppSettings = {
   chapter_batch_size?: 10 | 30 | 50 | 100;
   rewrite_parallelism?: 1 | 3 | 6 | 10 | 25 | 50;
   auto_continue_enabled?: boolean;
+  rewrite_strategy?: "legacy" | "protagonist_graph_v1";
+  style_prompt?: string;
+  rewrite_check_mode?: "off" | "tagged";
+  style_prompt_needs_review?: boolean;
 };
 
 export type TokenUsageDay = {
@@ -296,6 +304,11 @@ export type JobEstimate = {
   review_enabled: boolean;
   current_batch_requests: number;
   full_run_requests: number;
+  analysis_requests?: number;
+  planning_requests?: number;
+  rewrite_requests?: number;
+  review_requests?: number;
+  repair_requests_max?: number;
   average_call_seconds?: number | null;
   estimated_current_batch_seconds?: number | null;
   estimated_full_run_seconds?: number | null;

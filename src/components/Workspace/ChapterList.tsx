@@ -74,6 +74,12 @@ const ChapterButton = memo(function ChapterButton({
           status={chapter.rewrite_status}
           label={`改写 ${statusText[chapter.rewrite_status] ?? chapter.rewrite_status}`}
         />
+        {(chapter.rewrite_obligation_total ?? 0) > 0 && (
+          <StatusBadge
+            status={chapter.rewrite_validation_status ?? "unvalidated"}
+            label={`覆盖 ${chapter.rewrite_obligation_satisfied ?? 0}/${chapter.rewrite_obligation_total ?? 0} · ${chapter.rewrite_validation_status ?? "unvalidated"}`}
+          />
+        )}
       </span>
     </button>
   );

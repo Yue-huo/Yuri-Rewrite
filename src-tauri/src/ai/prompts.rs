@@ -1,5 +1,10 @@
-use crate::domain::{CanonAsset, Chapter, NovelSettings, ParsedChapterRewrite};
-use crate::{additional_feminize_name_sources, relationship_targets_summary, truncate_text};
+use crate::domain::{
+    CanonAsset, Chapter, NovelSettings, ParsedChapterRewrite, RewritePlan, SourceImpactNode,
+};
+use crate::{
+    additional_feminize_name_sources, protagonist_rule_pack, relationship_targets_summary,
+    truncate_text,
+};
 use std::collections::HashSet;
 
 #[allow(dead_code)]
@@ -53,13 +58,13 @@ pub(crate) fn build_novel_settings_prompt(settings: &NovelSettings) -> String {
 
 pub(crate) fn build_analysis_identity_context(settings: &NovelSettings) -> String {
     let alias_sources = additional_feminize_name_sources(&settings.protagonist_aliases);
-    if alias_sources.is_empty() {
+    if settings.protagonist_name.trim().is_empty() {
         return String::new();
     }
     format!(
         "已知原文人物身份提示（仅用于识别同一人物，不代表改写要求）：主角“{}”在原文中还可能以这些姓名或别名出现：{}。分析时应把这些称呼归属于同一人物，并记录原文实际使用方式；不得据此改变姓名、性别、关系或剧情。",
         settings.protagonist_name.trim(),
-        alias_sources.join("、")
+        if alias_sources.is_empty() { "无".to_string() } else { alias_sources.join("、") }
     )
 }
 
@@ -836,6 +841,94 @@ pub(crate) fn build_batch_rewrite_prompt_with_context(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_graph_rewrite_prompt_with_context(
+    chapters: &[Chapter],
+    canon_text: &str,
+    settings: &NovelSettings,
+    style_prompt: &str,
+    shard_context: &str,
+    plan: &RewritePlan,
+    nodes: &[SourceImpactNode],
+    continuity_json: &str,
+    tagged_check: bool,
+) -> String {
+    let contract_json = serde_json::to_string_pretty(plan).unwrap_or_else(|_| "{}".to_string());
+    let nodes_json = serde_json::to_string_pretty(nodes).unwrap_or_else(|_| "[]".to_string());
+    let current_draft = if chapters.iter().any(|chapter| {
+        chapter
+            .rewrite_text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+    }) {
+        build_batch_chapter_text(chapters, true)
+    } else {
+        "无".to_string()
+    };
+    let envelope = if tagged_check {
+        "输出必须且只能由一组 <rewrite_check>短核对</rewrite_check> 和一组 <output>完整 marker、标题与正文</output> 组成；标签不得重复，<output> 外不得有正文。"
+    } else {
+        "只输出完整 marker、标题与正文，不输出自检、解释、Markdown 或其他内容。"
+    };
+    format!(
+        r#"{marker_guard}
+
+{rule_pack}
+
+任务：严格执行当前分片改写契约。每个 obligation 都必须在最终正文中留下可引用的可见证据。
+- 姓名、代词、称谓或外貌替换不能单独算完成义务。
+- 不改变原著剧情功能、因果、能力、结果、人物动机或关系性质，不新增大型剧情分支或恋爱对象。
+- 只改写当前分片；相邻上下文只读。
+- {envelope}
+
+小说设定：
+{settings_prompt}
+
+全局风格补充（最低于事实、契约和连续性）：
+{style}
+
+当前分片改写契约：
+{contract_json}
+
+当前分片影响节点：
+{nodes_json}
+
+改写连续性状态：
+{continuity}
+
+其他相关一致性资产：
+{canon_text}
+
+当前改写稿（如有则是主要底稿；保留契约中已满足节点，只定向修复未满足节点和新要求）：
+{current_draft}
+
+处理范围与相邻只读上下文：
+{shard_context}
+
+当前原文章节：
+{chapters_text}
+
+{final_reminder}"#,
+        marker_guard = rewrite_marker_format_guard("当前输入章节"),
+        rule_pack = protagonist_rule_pack(),
+        envelope = envelope,
+        settings_prompt = build_compact_revision_settings_prompt(settings),
+        style = prompt_context_or_none(style_prompt),
+        contract_json = contract_json,
+        nodes_json = nodes_json,
+        continuity = prompt_context_or_none(continuity_json),
+        canon_text = canon_text,
+        current_draft = current_draft,
+        shard_context = prompt_context_or_none(shard_context),
+        chapters_text = build_batch_chapter_text(chapters, false),
+        final_reminder = if tagged_check {
+            "最终确认：先闭合唯一 <rewrite_check>，再在唯一 <output> 中逐字保留所有 START/END marker。".to_string()
+        } else {
+            rewrite_marker_final_reminder("当前输入章节")
+        }
+    )
+}
+
 pub(crate) fn build_single_chapter_rewrite_from_draft_prompt(
     chapter: &Chapter,
     canon_text: &str,
@@ -1035,7 +1128,20 @@ pub(crate) fn build_batch_analysis_prompt_with_identity(
   "locations": ["本批次地点、场景和空间关系"],
   "foreshadowing": ["本批次伏笔、悬念、回收或关键信息"],
   "terms": ["本批次术语、组织、物品、功法、系统规则等"],
-  "names": ["本批次出现的人名、称谓、别名、指代对象、对应人物的原文性别或性别不明状态"]
+  "names": ["本批次出现的人名、称谓、别名、指代对象、对应人物的原文性别或性别不明状态"],
+  "protagonist_impact_nodes": [{{
+    "chapter_index": 1,
+    "presence_kind": "direct | mentioned | consequence",
+    "participants": ["节点参与者"],
+    "source_evidence": "逐字摘录的一小段原文证据",
+    "narrative_function": "该节点在原著中的叙事功能",
+    "gender_mechanisms": ["原男性身份参与该互动或因果的方式；没有显式机制时说明其可受视角/表达影响"],
+    "state_before": "节点前的关系、认知或处境",
+    "state_after": "节点后的关系、认知或处境",
+    "thread_keys": ["可跨章追踪的关系线或因果线"],
+    "links": [{{"type": "causes | continues | pays_off | changes_state | same_thread", "target": "已知前序节点的章节索引和简短证据；未知可留空"}}],
+    "confidence": 0.9
+  }}]
 }}
 
 要求：
@@ -1044,8 +1150,11 @@ pub(crate) fn build_batch_analysis_prompt_with_identity(
 3. 不要补充原文没有的信息，不要改变原文人物、姓名、关系或剧情。
 4. 必须尽量记录人物的原文性别线索、代词、称谓和亲属身份；无法确定时写“性别不明”，不要猜测。
 5. 不要提出任何后续处理方向。
-6. JSON 字符串内部如果需要换行，必须写成 `\n`，不要在字符串里输出真实换行或其他控制字符。
-7. 只输出 JSON，不要解释、不要 Markdown。
+6. `protagonist_impact_nodes` 只记录原著事实，不规划后续处理。必须覆盖主角的行动、对话、心理、身体状态、决定、参与的全部互动、他人对主角的谈论/判断/回忆/误会/安排，以及主角不出场但此前行为造成后果的场景。真正无关的章节可以没有节点。
+7. 每个节点的 `source_evidence` 必须是当前输入对应章节正文中可定位的短原句，不得换言、拼接或伪造；不要输出 node_id、chapter_id 或 ordinal，它们由程序生成。
+8. 分析只使用下方人物身份提示识别谁是主角；不得推测任何目标姓名、目标外貌、目标文风或后续处理方式。
+9. JSON 字符串内部如果需要换行，必须写成 `\n`，不要在字符串里输出真实换行或其他控制字符。
+10. 只输出 JSON，不要解释、不要 Markdown。
 
 人物身份提示：
 {}

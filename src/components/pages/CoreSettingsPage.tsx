@@ -2,6 +2,9 @@ import { ArrowLeft, Loader2, Save } from "lucide-react";
 
 type CoreSettingsPageProps = {
   value: string;
+  strategy?: "legacy" | "protagonist_graph_v1";
+  legacyBackup?: string;
+  needsReview?: boolean;
   busy: boolean;
   disabled: boolean;
   onChange: (value: string) => void;
@@ -11,6 +14,9 @@ type CoreSettingsPageProps = {
 
 export function CoreSettingsPage({
   value,
+  strategy = "protagonist_graph_v1",
+  legacyBackup = "",
+  needsReview = false,
   busy,
   disabled,
   onChange,
@@ -29,16 +35,19 @@ export function CoreSettingsPage({
         </div>
       </div>
       <section className="settings-section core-settings-section">
-        <h3>全局改写风格</h3>
+        <h3>{strategy === "protagonist_graph_v1" ? "全局文风补充" : "旧版核心设定"}</h3>
         <p className="settings-note">
-          核心设定不随小说变化，会在每一次改写和打回重写时发送给 AI，并作为最高优先级的写作要求。建议主要填写文风、叙述节奏、描写密度、语气、对白风格、情绪氛围等全局写法；不要写某一本小说的主角姓名、剧情设定、章节内容或临时任务，避免影响其他小说。
+          {strategy === "protagonist_graph_v1"
+            ? "这里只承载文风、叙述节奏、描写密度、语气、对白和情绪氛围。它位于规则包、原著事实、分片契约和连续性之后，不能覆盖结构化改写义务。"
+            : "旧版核心设定会作为旧流程的全局改写要求发送给 AI。切回主角主动重构时，它仍会原样保留为备份。"}
         </p>
+        {needsReview && strategy === "protagonist_graph_v1" && <p className="settings-empty-hint">旧提示词无法可靠拆分，已完整复制到全局文风。请人工删除姓名、剧情或行为规则，只保留文风偏好。</p>}
         <textarea
           className="core-settings-input"
           disabled={disabled}
           value={value}
           onChange={(event) => onChange(event.target.value)}
-          placeholder="例如：保持原文轻小说风格，句子自然流畅；减少机械替换感；动作描写细腻但不过度堆砌；对白保留角色原本语气；百合互动要循序渐进，不要突然强行亲密。"
+          placeholder={strategy === "protagonist_graph_v1" ? "例如：保持原文轻小说风格，句子自然流畅；动作描写细腻但不过度堆砌；对白保留角色原本语气。" : "旧版全局核心提示词"}
         />
         {!value.trim() && (
           <p className="settings-empty-hint">
@@ -46,6 +55,13 @@ export function CoreSettingsPage({
           </p>
         )}
       </section>
+      {strategy === "protagonist_graph_v1" && legacyBackup.trim() && (
+        <section className="settings-section core-settings-section">
+          <h3>旧核心设定备份（只读）</h3>
+          <p className="settings-note">升级时保留的原始 core_prompt，不会注入主角主动重构流程。</p>
+          <textarea className="core-settings-input" readOnly value={legacyBackup} />
+        </section>
+      )}
     </div>
   );
 }

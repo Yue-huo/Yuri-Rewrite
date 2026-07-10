@@ -463,6 +463,9 @@ mod tests {
             single_rewrite_original_available: false,
             analysis_status: "pending".to_string(),
             rewrite_status: "pending".to_string(),
+            rewrite_validation_status: "unvalidated".to_string(),
+            rewrite_obligation_total: 0,
+            rewrite_obligation_satisfied: 0,
         }
     }
 

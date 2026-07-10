@@ -8,7 +8,7 @@ const automaticPauseKinds = new Set<AutoRunPauseKind>([
   "content_filter"
 ]);
 
-const retryDelays: Record<Exclude<AutoRunPauseKind, "user" | "interrupted" | "unknown" | "">, number[]> = {
+const retryDelays: Record<Exclude<AutoRunPauseKind, "user" | "interrupted" | "quality_gate" | "unknown" | "">, number[]> = {
   rate_limit: [300, 600, 900],
   network: [10, 30, 60, 120, 300],
   temporary_gateway: [10, 30, 60, 120, 300],

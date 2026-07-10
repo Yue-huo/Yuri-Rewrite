@@ -13,6 +13,8 @@ pub(crate) struct ReviewPipelineContext<'a> {
     pub(crate) canon_text: &'a str,
     pub(crate) settings: &'a NovelSettings,
     pub(crate) core_prompt: &'a str,
+    pub(crate) rewrite_strategy: &'a str,
+    pub(crate) rewrite_check_mode: &'a str,
     pub(crate) parallelism: usize,
     pub(crate) checkpoint_batch_index: Option<i64>,
 }
@@ -33,6 +35,8 @@ pub(crate) async fn run_review_pipeline(
         context.canon_text,
         context.settings,
         context.core_prompt,
+        context.rewrite_strategy,
+        context.rewrite_check_mode,
         context.parallelism,
         context.checkpoint_batch_index,
     )

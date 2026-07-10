@@ -134,6 +134,7 @@ const savedApiKeyMask = "********";
 const quickStartSeenKey = "yuri-rewrite.quick-start-seen";
 const themePreferenceKey = "yuri-rewrite.theme";
 const qualityIgnoreKeyPrefix = "yuri-rewrite.qualityIgnored.v1.";
+const systemManagedCanonKinds = new Set(["主角性别影响图", "改写连续性状态"]);
 const resetAppSettings: AppSettings = {
   export_dir: null,
   core_prompt: "",
@@ -143,7 +144,11 @@ const resetAppSettings: AppSettings = {
   selected_profile_id: null,
   chapter_batch_size: 30,
   rewrite_parallelism: 10,
-  auto_continue_enabled: false
+  auto_continue_enabled: false,
+  rewrite_strategy: "protagonist_graph_v1",
+  style_prompt: "",
+  rewrite_check_mode: "off",
+  style_prompt_needs_review: false
 };
 const modelSuggestionGroups: ModelSuggestionGroup[] = [
   {
@@ -316,6 +321,8 @@ function batchIdContainingChapter(detail: NovelDetail, chapterId: string): strin
 
 const jobPhaseText: Record<string, string> = {
   analysis: "分析",
+  planning: "规划",
+  rewrite_draft: "草稿待验收",
   rewrite: "改写",
   review: "审查",
   revision: "修复",
@@ -388,6 +395,7 @@ export default function App() {
   const [logCache, setLogCache] = useState<Record<string, AiLog[]>>({});
   const [settings, setSettings] = useState<AppSettings>({});
   const [corePromptDraft, setCorePromptDraft] = useState("");
+  const [stylePromptDraft, setStylePromptDraft] = useState("");
   const [jobEstimate, setJobEstimate] = useState<JobEstimate | null>(null);
   const [estimateCollapsed, setEstimateCollapsed] = useState(false);
   const [modelDiagnosis, setModelDiagnosis] = useState<ModelDiagnosis | null>(null);
@@ -548,7 +556,7 @@ export default function App() {
           ? (job.shard_completed ?? 0) / job.shard_total
         : 0;
       if (job.phase === "analysis") return Math.round(stageRatio * 50);
-      if (["rewrite", "review", "revision", "final_review"].includes(job.phase ?? "")) {
+      if (["planning", "rewrite", "review", "revision", "final_review"].includes(job.phase ?? "")) {
         return Math.round(50 + stageRatio * 50);
       }
     }
@@ -759,6 +767,9 @@ export default function App() {
   useEffect(() => {
     setCorePromptDraft(settings.core_prompt ?? "");
   }, [settings.core_prompt]);
+  useEffect(() => {
+    setStylePromptDraft(settings.style_prompt ?? "");
+  }, [settings.style_prompt]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1412,7 +1423,9 @@ export default function App() {
     setBusy("canon");
     setNotice("");
     try {
-      const assets = detail.canon_assets.map(({ kind, content }) => ({ kind, content }));
+      const assets = detail.canon_assets
+        .filter(({ kind }) => !systemManagedCanonKinds.has(kind))
+        .map(({ kind, content }) => ({ kind, content }));
       const updated = await invoke("update_canon_assets", {
         novelId: detail.novel.id,
         assets
@@ -1720,6 +1733,10 @@ export default function App() {
       chapter_batch_size: settings.chapter_batch_size ?? 30,
       rewrite_parallelism: settings.rewrite_parallelism ?? 10,
       auto_continue_enabled: settings.auto_continue_enabled ?? false,
+      rewrite_strategy: settings.rewrite_strategy ?? "protagonist_graph_v1",
+      style_prompt: settings.style_prompt ?? "",
+      rewrite_check_mode: settings.rewrite_check_mode ?? "off",
+      style_prompt_needs_review: settings.style_prompt_needs_review ?? false,
       ...overrides
     };
   }
@@ -1778,6 +1795,10 @@ export default function App() {
   }
 
   async function toggleReviewEnabled() {
+    if ((settings.rewrite_strategy ?? "protagonist_graph_v1") === "protagonist_graph_v1") {
+      showNotice("主角主动重构模式强制执行覆盖复检，不能关闭。");
+      return;
+    }
     setBusy("review-setting");
     setNotice("");
     try {
@@ -1788,6 +1809,39 @@ export default function App() {
       setSettings(saved);
       await refreshJobEstimate();
       showNotice(nextEnabled ? "已开启改写复检。" : "已关闭改写复检。");
+    } catch (error) {
+      showNotice(String(error));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function setRewriteStrategy(strategy: "legacy" | "protagonist_graph_v1") {
+    setBusy("rewrite-strategy-setting");
+    setNotice("");
+    try {
+      const saved = await invoke("save_app_settings", {
+        settings: appSettingsPayload({ rewrite_strategy: strategy, review_enabled: strategy === "protagonist_graph_v1" ? true : settings.review_enabled })
+      });
+      setSettings(saved);
+      await refreshJobEstimate();
+      showNotice(strategy === "protagonist_graph_v1" ? "已启用主角主动重构与强制覆盖复检。" : "已切换为旧版兼容流程。");
+    } catch (error) {
+      showNotice(String(error));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function setRewriteCheckMode(mode: "off" | "tagged") {
+    setBusy("rewrite-check-setting");
+    setNotice("");
+    try {
+      const saved = await invoke("save_app_settings", {
+        settings: appSettingsPayload({ rewrite_check_mode: mode })
+      });
+      setSettings(saved);
+      showNotice(mode === "tagged" ? "已开启高级短自检包装。" : "已关闭高级短自检包装。");
     } catch (error) {
       showNotice(String(error));
     } finally {
@@ -1898,6 +1952,7 @@ export default function App() {
       setLogCache({});
       setSettings(resetAppSettings);
       setCorePromptDraft("");
+      setStylePromptDraft("");
       setJobEstimate(null);
       setModelDiagnosis(null);
       setAutoRunRecoveries([]);
@@ -1948,10 +2003,16 @@ export default function App() {
     setNotice("");
     try {
       const saved = await invoke("save_app_settings", {
-        settings: appSettingsPayload({ core_prompt: corePromptDraft })
+        settings: appSettingsPayload(
+          (settings.rewrite_strategy ?? "protagonist_graph_v1") === "protagonist_graph_v1"
+            ? { style_prompt: stylePromptDraft }
+            : { core_prompt: corePromptDraft }
+        )
       });
       setSettings(saved);
-      showNotice(corePromptDraft.trim() ? "核心设定已保存。" : "核心设定已清空。");
+      const graphStrategy = (settings.rewrite_strategy ?? "protagonist_graph_v1") === "protagonist_graph_v1";
+      const value = graphStrategy ? stylePromptDraft : corePromptDraft;
+      showNotice(value.trim() ? (graphStrategy ? "全局文风已保存。" : "旧版核心设定已保存。") : (graphStrategy ? "全局文风已清空。" : "旧版核心设定已清空。"));
     } catch (error) {
       showNotice(String(error));
     } finally {
@@ -2848,10 +2909,13 @@ export default function App() {
 
         {activeView === "core-settings" && (
           <CoreSettingsPage
-            value={corePromptDraft}
+            value={(settings.rewrite_strategy ?? "protagonist_graph_v1") === "protagonist_graph_v1" ? stylePromptDraft : corePromptDraft}
+            strategy={settings.rewrite_strategy ?? "protagonist_graph_v1"}
+            legacyBackup={corePromptDraft}
+            needsReview={settings.style_prompt_needs_review ?? false}
             busy={busy === "core-settings"}
             disabled={processingTaskActive}
-            onChange={setCorePromptDraft}
+            onChange={(value) => (settings.rewrite_strategy ?? "protagonist_graph_v1") === "protagonist_graph_v1" ? setStylePromptDraft(value) : setCorePromptDraft(value)}
             onBack={() => requestActiveView("workspace")}
             onSave={saveCoreSettings}
           />
@@ -2883,6 +2947,8 @@ export default function App() {
             onChooseExportDir={chooseExportDir}
             onClearExportDir={clearExportDir}
             onToggleReview={toggleReviewEnabled}
+            onRewriteStrategyChange={setRewriteStrategy}
+            onRewriteCheckModeChange={setRewriteCheckMode}
             onReviewProfileChange={setReviewProfileId}
             onAnalysisProfileChange={setAnalysisProfileId}
             onBatchSizeChange={setChapterBatchSize}
@@ -3004,12 +3070,12 @@ export default function App() {
               <div className="asset-stack">
                 {detail?.canon_assets.map((asset) => (
                   <label key={asset.kind}>
-                    {asset.kind}
+                    {asset.kind}{systemManagedCanonKinds.has(asset.kind) ? "（系统只读）" : ""}
                     <textarea
                       value={asset.content}
                       onChange={(event) => updateCanon(asset.kind, event.target.value)}
-                      placeholder="分析后会自动生成，也可以手动补充。"
-                      disabled={processingTaskActive}
+                      placeholder={systemManagedCanonKinds.has(asset.kind) ? "由分析、规划和覆盖复检自动维护。" : "分析后会自动生成，也可以手动补充。"}
+                      disabled={processingTaskActive || systemManagedCanonKinds.has(asset.kind)}
                     />
                   </label>
                 ))}

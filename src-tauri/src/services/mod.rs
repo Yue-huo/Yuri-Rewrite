@@ -1,8 +1,9 @@
 pub(crate) mod analysis;
+pub(crate) mod coverage;
 pub(crate) mod estimation;
+pub(crate) mod planning;
 pub(crate) mod progress;
 pub(crate) mod repair;
 pub(crate) mod review;
 pub(crate) mod rewrite;
 pub(crate) mod shard_context;
-pub(crate) mod validation;

@@ -2,8 +2,11 @@ use crate::domain::{AppState, CanonAsset, CanonAssetInput, Chapter, ChapterBatch
 use crate::task_control::{AutoRunControl, AutoRunProgressState};
 use crate::{
     chapter_text_chars, estimate_requests_for_chapters, estimate_wait_seconds_for_chapters,
+    graph_strategy_name_enabled,
     load_canon_assets, load_chapter_batches, load_chapters, load_recent_model_stats,
-    load_review_enabled, load_rewrite_parallelism, row_to_chapter, to_string,
+    load_review_enabled, load_rewrite_parallelism, load_rewrite_strategy, row_to_chapter,
+    split_chapters_for_parallelism, to_string, IMPACT_GRAPH_ASSET_KIND,
+    REWRITE_CONTINUITY_ASSET_KIND,
 };
 use chrono::Utc;
 use rusqlite::params;
@@ -103,7 +106,10 @@ fn load_chapter_by_id(conn: &rusqlite::Connection, chapter_id: &str) -> Result<C
         "SELECT id, novel_id, chapter_index, title, original_text, analysis_json, rewrite_text,
             rewrite_edited_at IS NOT NULL,
             EXISTS (SELECT 1 FROM chapter_rewrite_snapshots WHERE chapter_id = chapters.id),
-            analysis_status, rewrite_status
+            analysis_status, rewrite_status,
+            COALESCE((SELECT validation_status FROM rewrite_contracts WHERE chapter_id = chapters.id), 'unvalidated'),
+            COALESCE((SELECT obligation_total FROM rewrite_contracts WHERE chapter_id = chapters.id), 0),
+            COALESCE((SELECT obligation_satisfied FROM rewrite_contracts WHERE chapter_id = chapters.id), 0)
          FROM chapters WHERE id = ?1",
         params![chapter_id],
         row_to_chapter,
@@ -127,6 +133,11 @@ pub(crate) fn update_chapter_title(
     conn.execute(
         "UPDATE chapters SET title = ?1 WHERE id = ?2",
         params![normalized_title, chapter_id],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "UPDATE rewrite_contracts SET validation_status = 'stale', updated_at = ?1 WHERE chapter_id = ?2",
+        params![Utc::now().to_rfc3339(), chapter_id],
     )
     .map_err(to_string)?;
     load_chapter_by_id(&conn, &chapter_id)
@@ -155,6 +166,11 @@ pub(crate) fn save_chapter_rewrite_edit(
     conn.execute(
         "UPDATE chapters SET ai_rewrite_text = COALESCE(ai_rewrite_text, rewrite_text), rewrite_text = ?1, rewrite_edited_at = ?2 WHERE id = ?3",
         params![rewrite_text, Utc::now().to_rfc3339(), chapter_id],
+    )
+    .map_err(to_string)?;
+    conn.execute(
+        "UPDATE rewrite_contracts SET validation_status = 'stale', updated_at = ?1 WHERE chapter_id = ?2",
+        params![Utc::now().to_rfc3339(), chapter_id],
     )
     .map_err(to_string)?;
     load_chapter_by_id(&conn, &chapter_id)
@@ -260,7 +276,9 @@ pub(crate) fn estimate_job_cost(
     let chapters = load_chapters(&conn, &novel_id)?;
     let batches = load_chapter_batches(&conn, &novel_id)?;
     let parallelism = load_rewrite_parallelism(&conn)?;
-    let review_enabled = load_review_enabled(&conn)?;
+    let rewrite_strategy = load_rewrite_strategy(&conn)?;
+    let graph_strategy = graph_strategy_name_enabled(&rewrite_strategy);
+    let review_enabled = graph_strategy || load_review_enabled(&conn)?;
     let chapters_by_batch = batches
         .iter()
         .map(|batch| {
@@ -281,14 +299,22 @@ pub(crate) fn estimate_job_cost(
         .get(selected_batch_index)
         .cloned()
         .unwrap_or_default();
+    let selected_shards = split_chapters_for_parallelism(&selected_batch, parallelism).len();
+    let full_shards = chapters_by_batch
+        .iter()
+        .map(|batch_chapters| split_chapters_for_parallelism(batch_chapters, parallelism).len())
+        .sum::<usize>();
+    let planning_requests = usize::from(graph_strategy) * selected_shards;
     let current_batch_requests =
-        estimate_requests_for_chapters(&selected_batch, parallelism, review_enabled);
+        estimate_requests_for_chapters(&selected_batch, parallelism, review_enabled)
+            + planning_requests;
     let full_run_requests = chapters_by_batch
         .iter()
         .map(|batch_chapters| {
             estimate_requests_for_chapters(batch_chapters, parallelism, review_enabled)
         })
-        .sum::<usize>();
+        .sum::<usize>()
+        + usize::from(graph_strategy) * full_shards;
     let stats = profile_id
         .as_deref()
         .filter(|id| !id.trim().is_empty())
@@ -296,6 +322,13 @@ pub(crate) fn estimate_job_cost(
         .unwrap_or_default();
     let average_call_seconds = stats.average_call_seconds();
     let average_input_chars = stats.average_input_chars();
+    let planning_wait_factor = if graph_strategy && review_enabled {
+        8.0 / 7.0
+    } else if graph_strategy {
+        3.0 / 2.0
+    } else {
+        1.0
+    };
     Ok(JobEstimate {
         novel_chapters: chapters.len(),
         novel_chars: chapters.iter().map(chapter_text_chars).sum(),
@@ -306,6 +339,19 @@ pub(crate) fn estimate_job_cost(
         review_enabled,
         current_batch_requests,
         full_run_requests,
+        analysis_requests: selected_shards,
+        planning_requests,
+        rewrite_requests: selected_shards,
+        review_requests: if review_enabled {
+            selected_shards * 3
+        } else {
+            0
+        },
+        repair_requests_max: if review_enabled {
+            selected_shards * 2
+        } else {
+            0
+        },
         average_call_seconds,
         estimated_current_batch_seconds: estimate_wait_seconds_for_chapters(
             &selected_batch,
@@ -313,7 +359,8 @@ pub(crate) fn estimate_job_cost(
             review_enabled,
             average_call_seconds,
             average_input_chars,
-        ),
+        )
+        .map(|seconds| seconds * planning_wait_factor),
         estimated_full_run_seconds: average_call_seconds.map(|_| {
             chapters_by_batch
                 .iter()
@@ -326,7 +373,8 @@ pub(crate) fn estimate_job_cost(
                         average_input_chars,
                     )
                 })
-                .sum()
+                .sum::<f64>()
+                * planning_wait_factor
         }),
         recent_success_calls: stats.success_calls,
         recent_failed_calls: stats.failed_calls,
@@ -353,6 +401,12 @@ pub(crate) fn update_canon_assets(
     let conn = state.conn.lock().map_err(to_string)?;
     let updated_at = Utc::now().to_rfc3339();
     for asset in assets {
+        if matches!(
+            asset.kind.as_str(),
+            IMPACT_GRAPH_ASSET_KIND | REWRITE_CONTINUITY_ASSET_KIND
+        ) {
+            return Err(format!("{} 是系统管理的只读资产，不能手工修改。", asset.kind));
+        }
         conn.execute(
             r#"
             INSERT INTO canon_assets (novel_id, kind, content, updated_at)
@@ -413,6 +467,9 @@ mod tests {
             single_rewrite_original_available: false,
             analysis_status: "completed".to_string(),
             rewrite_status: "completed".to_string(),
+            rewrite_validation_status: "unvalidated".to_string(),
+            rewrite_obligation_total: 0,
+            rewrite_obligation_satisfied: 0,
         }
     }
 

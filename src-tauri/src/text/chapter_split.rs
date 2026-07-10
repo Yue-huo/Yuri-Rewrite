@@ -47,6 +47,9 @@ pub(crate) fn split_chapters(novel_id: &str, text: &str) -> SplitResult {
             single_rewrite_original_available: false,
             analysis_status: "pending".to_string(),
             rewrite_status: "pending".to_string(),
+            rewrite_validation_status: "unvalidated".to_string(),
+            rewrite_obligation_total: 0,
+            rewrite_obligation_satisfied: 0,
         })
         .collect();
     SplitResult {
@@ -137,6 +140,9 @@ pub(crate) fn split_chapters_with_custom_rule(
             single_rewrite_original_available: false,
             analysis_status: "pending".to_string(),
             rewrite_status: "pending".to_string(),
+            rewrite_validation_status: "unvalidated".to_string(),
+            rewrite_obligation_total: 0,
+            rewrite_obligation_satisfied: 0,
         })
         .collect();
     Ok(SplitResult {
@@ -175,6 +181,9 @@ pub(crate) fn split_long_detected_chapters(
                 single_rewrite_original_available: false,
                 analysis_status: "pending".to_string(),
                 rewrite_status: "pending".to_string(),
+                rewrite_validation_status: "unvalidated".to_string(),
+                rewrite_obligation_total: 0,
+                rewrite_obligation_satisfied: 0,
             });
         }
     }
@@ -1325,6 +1334,9 @@ pub(crate) fn chunk_without_headings(novel_id: &str, text: &str) -> Vec<Chapter>
             single_rewrite_original_available: false,
             analysis_status: "pending".to_string(),
             rewrite_status: "pending".to_string(),
+            rewrite_validation_status: "unvalidated".to_string(),
+            rewrite_obligation_total: 0,
+            rewrite_obligation_satisfied: 0,
         })
         .collect()
 }

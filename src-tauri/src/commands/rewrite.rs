@@ -9,7 +9,8 @@ use crate::{
     format_model_log_content, generate_text, load_canon_assets, load_chapter_batches,
     load_chapters, load_chapters_for_batch, load_core_prompt, load_job, load_model_profile,
     load_review_enabled, load_review_profile_for_run, load_review_profile_id,
-    load_rewrite_parallelism, mark_empty_source_chapters_skipped, parse_rewrite_model_output,
+    load_rewrite_check_mode, load_rewrite_parallelism, load_rewrite_strategy, load_style_prompt,
+    graph_strategy_name_enabled, mark_empty_source_chapters_skipped, parse_rewrite_model_output,
     read_stored_api_key, require_novel_settings, restore_orphaned_rewrite_status_for_chapter,
     rewrite_batch_with_parallelism, set_chapter_status, to_string, truncate_text,
     truncate_text_tail, update_job, SYSTEM_REWRITE_EXPERT,
@@ -31,17 +32,29 @@ pub(crate) async fn start_rewrite(
         all_chapters,
         settings,
         core_prompt,
+        rewrite_strategy,
+        rewrite_check_mode,
         review_enabled,
         review_profile_id,
         rewrite_parallelism,
     ) = {
         let conn = state.conn.lock().map_err(to_string)?;
         let settings = require_novel_settings(&conn, &novel_id)?;
+        let rewrite_strategy = load_rewrite_strategy(&conn)?;
+        let review_enabled = graph_strategy_name_enabled(&rewrite_strategy)
+            || load_review_enabled(&conn)?;
+        let core_prompt = if graph_strategy_name_enabled(&rewrite_strategy) {
+            load_style_prompt(&conn)?.0
+        } else {
+            load_core_prompt(&conn)?
+        };
         (
             load_chapters_for_batch(&conn, &novel_id, &batch_id)?,
             settings,
-            load_core_prompt(&conn)?,
-            load_review_enabled(&conn)?,
+            core_prompt,
+            rewrite_strategy,
+            load_rewrite_check_mode(&conn)?,
+            review_enabled,
             load_review_profile_id(&conn)?,
             load_rewrite_parallelism(&conn)?,
         )
@@ -122,6 +135,8 @@ pub(crate) async fn start_rewrite(
                 canon_text: &canon_text,
                 settings: &settings,
                 core_prompt: &core_prompt,
+                rewrite_strategy: &rewrite_strategy,
+                rewrite_check_mode: &rewrite_check_mode,
                 review_enabled,
                 review_profile: review_profile.as_ref(),
                 review_api_key: review_api_key.as_deref(),
@@ -174,12 +189,22 @@ pub(crate) async fn rewrite_single_chapter(
         mut chapter,
         settings,
         core_prompt,
+        rewrite_strategy,
+        rewrite_check_mode,
         review_enabled,
         review_profile_id,
         rewrite_parallelism,
     ) = {
         let conn = state.conn.lock().map_err(to_string)?;
         let settings = require_novel_settings(&conn, &novel_id)?;
+        let rewrite_strategy = load_rewrite_strategy(&conn)?;
+        let review_enabled = graph_strategy_name_enabled(&rewrite_strategy)
+            || load_review_enabled(&conn)?;
+        let core_prompt = if graph_strategy_name_enabled(&rewrite_strategy) {
+            load_style_prompt(&conn)?.0
+        } else {
+            load_core_prompt(&conn)?
+        };
         let chapter = load_chapters(&conn, &novel_id)?
             .into_iter()
             .find(|chapter| chapter.id == chapter_id)
@@ -194,8 +219,10 @@ pub(crate) async fn rewrite_single_chapter(
             load_chapters_for_batch(&conn, &novel_id, &batch.id)?,
             chapter,
             settings,
-            load_core_prompt(&conn)?,
-            load_review_enabled(&conn)?,
+            core_prompt,
+            rewrite_strategy,
+            load_rewrite_check_mode(&conn)?,
+            review_enabled,
             load_review_profile_id(&conn)?,
             load_rewrite_parallelism(&conn)?,
         )
@@ -206,7 +233,9 @@ pub(crate) async fn rewrite_single_chapter(
     if chapter.analysis_status != "completed" {
         return Err("当前章节尚未完成分析，不能单独重新改写。".to_string());
     }
-    let (review_profile, review_api_key) = if source_mode == "original" {
+    let (review_profile, review_api_key) = if source_mode == "original"
+        || graph_strategy_name_enabled(&rewrite_strategy)
+    {
         load_review_profile_for_run(
             &state,
             &profile,
@@ -247,7 +276,10 @@ pub(crate) async fn rewrite_single_chapter(
             let conn = state.conn.lock().map_err(to_string)?;
             load_canon_assets(&conn, &novel_id)?
         };
-        let target = vec![chapter.clone()];
+        let mut target = vec![chapter.clone()];
+        if source_mode == "original" {
+            target[0].rewrite_text = None;
+        }
         let canon_text = build_relevant_canon_text(&canon_assets, &target, &settings);
         let custom_instructions = instructions.trim();
         let single_chapter_core_prompt = if custom_instructions.is_empty() {
@@ -265,7 +297,7 @@ pub(crate) async fn rewrite_single_chapter(
             )
         };
 
-        if source_mode == "rewrite" {
+        if source_mode == "rewrite" && !graph_strategy_name_enabled(&rewrite_strategy) {
             let adjacent_context = build_single_chapter_adjacent_context(&all_chapters, &chapter);
             let prompt = build_single_chapter_rewrite_from_draft_prompt(
                 &chapter,
@@ -313,6 +345,8 @@ pub(crate) async fn rewrite_single_chapter(
                 &canon_text,
                 &settings,
                 &single_chapter_core_prompt,
+                &rewrite_strategy,
+                &rewrite_check_mode,
                 review_enabled,
                 review_profile.as_ref(),
                 review_api_key.as_deref(),
@@ -479,6 +513,9 @@ mod tests {
             single_rewrite_original_available: false,
             analysis_status: "completed".to_string(),
             rewrite_status: "completed".to_string(),
+            rewrite_validation_status: "unvalidated".to_string(),
+            rewrite_obligation_total: 0,
+            rewrite_obligation_satisfied: 0,
         }
     }
 

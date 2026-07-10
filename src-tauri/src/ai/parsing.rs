@@ -139,6 +139,7 @@ pub(crate) fn extract_batch_level_analysis_json(
         "foreshadowing",
         "terms",
         "names",
+        "protagonist_impact_nodes",
     ];
     if !useful_fields
         .iter()

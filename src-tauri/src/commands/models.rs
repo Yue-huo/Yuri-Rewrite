@@ -142,6 +142,25 @@ pub(crate) fn save_model_profile(
             None => database_error,
         });
     }
+    let is_current_rewrite_model = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_settings WHERE key = 'selected_profile_id' AND value = ?1)",
+            params![id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    if is_current_rewrite_model {
+        conn.execute(
+            "UPDATE rewrite_contracts SET validation_status = 'stale', updated_at = ?1",
+            params![Utc::now().to_rfc3339()],
+        )
+        .map_err(to_string)?;
+        conn.execute(
+            "DELETE FROM auto_run_shard_outputs WHERE phase = 'rewrite_draft'",
+            [],
+        )
+        .map_err(to_string)?;
+    }
     let storage = api_key_storage(&conn, &id);
     let mut profile = profile;
     profile.has_api_key = storage != ApiKeyStorage::None;
