@@ -83,6 +83,7 @@ import type {
   UpdateProgress
 } from "./types";
 import { formatSystemCanonAsset, systemManagedCanonKinds } from "./canonDisplay";
+import { formatUserFacingJobMessage } from "./jobDisplay";
 import { type AutoRunProgress, useAutoRunProgress } from "./useAutoRunProgress";
 import {
   autoContinueDelaySeconds,
@@ -2793,7 +2794,7 @@ export default function App() {
               <span className="job-summary">
                 <span>{jobTypeText[job.job_type] ?? job.job_type}</span>
                 <StatusBadge status={job.status} label={statusText[job.status] ?? job.status} />
-                <span>{job.current_chapter}/{job.total_chapters} · {job.message}</span>
+                <span>{job.current_chapter}/{job.total_chapters} · {formatUserFacingJobMessage(job.message)}</span>
                 {autoContinuePending ? ` · 将在 ${autoContinueSeconds} 秒后自动继续` : ""}
                 {job.job_type === "auto" && autoRemainingSeconds !== null && job.status === "running"
                   ? ` · 预计剩余 ${formatSeconds(autoRemainingSeconds)}`
