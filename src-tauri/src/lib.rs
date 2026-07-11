@@ -3093,7 +3093,7 @@ fn build_targeted_revision_prompt(
     let core_prompt = if core_prompt.trim().is_empty() {
         "无".to_string()
     } else {
-        truncate_text(core_prompt.trim(), 1_200)
+        truncate_text(core_prompt.trim(), 12_000)
     };
     let advanced_settings = if settings.advanced_settings.trim().is_empty() {
         "无".to_string()
@@ -3120,7 +3120,7 @@ fn build_targeted_revision_prompt(
 - 核心设定：{}
 - 高级设定：{}
 - 保留原章节顺序、原文主线、因果、战力、伏笔、人物动机和目标章节 marker。
-- 只修复 blocking 问题，不改动已合格内容；未指定性转角色保持原文性别；主角与男性共同被指代或群体含男性成员时使用“他们”或准确群体称呼，只有全员女性时才使用“她们”；性别不明的动物、灵兽等非人生物保留原文代词可通过。
+- 先修复 blocking 问题，再逐项核对核心设定中“本次修复所需契约”的全部 required_changes 及其分号分隔子要求；缺少的动作、心理、他人反应、互动边界或连续性细节必须在本次一并补齐。不得只满足一个例子就跳过同一义务的其他要求，也不得改坏已合格内容。未指定性转角色保持原文性别；主角与男性共同被指代或群体含男性成员时使用“他们”或准确群体称呼，只有全员女性时才使用“她们”；性别不明的动物、灵兽等非人生物保留原文代词可通过。
 - {}
 - 每个目标章节必须完整输出原 `<<<YURI_REWRITE_CHAPTER_START ...>>>` 和 `<<<YURI_REWRITE_CHAPTER_END ...>>>`，marker 的 index 和 id 逐字复制。
 - 只输出目标章节的 marker、标题、正文；不要解释、不要 Markdown。
@@ -4961,9 +4961,9 @@ fn build_graph_review_decision_prompt(
 
 审批硬条件：
 1. 契约中的每个 obligation_id 必须在 coverage 中恰好出现一次，不能出现未知义务。
-2. 逐项比较原文、契约和当前改写稿；只有发生了 required_changes 所要求的可见深层变化，status 才能是 satisfied。
+2. 逐项比较原文、契约和当前改写稿；必须拆开核对每个 required_changes 数组项及其中由分号分隔的各项动作、心理、他人反应、互动边界和连续性子要求。只有所有实质子要求都有正文证据时，status 才能是 satisfied；不得因为命中其中一个例子就批准整项义务。
 3. 姓名、代词、称谓或外貌变化不能单独证明义务满足；partial、missed、regressed 一律 blocking。
-4. coverage.evidence 必须逐字引用当前改写稿中真实存在的短证据；不得引用原文、契约或自行概括。
+4. coverage.evidence 必须逐字引用当前改写稿中真实存在的短证据；同一义务有多个实质子要求时，用中文分号分隔对应的多段短引用。不得引用原文、契约、自行概括或用省略号拼接成不存在的连续句。
 5. 剧情、结果、能力、身份、关系性质、marker、边界或连续性回归均为 blocking。
 6. state_updates 只逐字段原样复制契约对象最外层 planned_state_updates（包括 value）；不要重复 obligations[].planned_state_updates 中已被后续状态覆盖的中间状态。只报告本稿确实建立且可供后文使用的状态，不得概括、改写或新增状态。
 
@@ -10327,6 +10327,42 @@ mod tests {
         assert!(!prompt.contains(&format!("原文内容 3 {}", "很长正文".repeat(20))));
         assert!(!prompt.contains(&chapter_start_marker(&chapters[0])));
         assert!(!prompt.contains(&chapter_start_marker(&chapters[2])));
+    }
+
+    #[test]
+    fn targeted_revision_prompt_keeps_the_structured_repair_contract() {
+        let chapter = sample_chapter(1, "第一章", "她拖着行李箱回乡。 ");
+        let rewrite = ParsedChapterRewrite {
+            id: chapter.id.clone(),
+            index: chapter.index,
+            title: chapter.title.clone(),
+            text: "她拖着行李箱回乡。".to_string(),
+        };
+        let decision = ReviewDecision {
+            approved: false,
+            issues: vec![sample_review_issue(
+                vec![1],
+                "chapter",
+                "identity",
+                "混合家庭代词错误。",
+            )],
+        };
+        let contract_tail = "REQUIRED_CONTRACT_TAIL_脚步疲惫但仍有内心倔强";
+        let repair_core = format!("{}{}", "修复规则。".repeat(400), contract_tail);
+
+        let prompt = build_targeted_revision_prompt(
+            std::slice::from_ref(&chapter),
+            std::slice::from_ref(&rewrite),
+            "姓名映射表：许纸 -> 白纸",
+            &sample_novel_settings(),
+            &repair_core,
+            "",
+            &decision,
+            "",
+        );
+
+        assert!(prompt.contains(contract_tail));
+        assert!(prompt.contains("逐项核对核心设定中“本次修复所需契约”"));
     }
 
     #[test]

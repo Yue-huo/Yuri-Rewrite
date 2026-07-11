@@ -138,12 +138,17 @@ pub(crate) fn build_repair_core_prompt(
         .filter(|obligation| issue_text.contains(&obligation.obligation_id))
         .map(|obligation| obligation.obligation_id.clone())
         .collect::<HashSet<_>>();
+    let style_prompt = if style_prompt.trim().is_empty() {
+        "无".to_string()
+    } else {
+        crate::truncate_text(style_prompt.trim(), 2_000)
+    };
     format!(
-        "{}\n\n【本次修复所需契约】\n{}\n\n【相关已通过连续性状态】\n{}\n\n【低优先级全局文风补充】\n{}",
+        "【修复完整性要求】\n修复已列出的 blocking 问题后，必须重新逐项核对本次修复契约中的每个 required_changes 及其分号分隔子要求；发现当前稿仍缺少的动作、心理、他人反应、互动边界或连续性细节时一并补齐。不得只满足其中一个例子就认定整项义务完成，也不得破坏已合格内容。\n\n{}\n\n【本次修复所需契约】\n{}\n\n【相关已通过连续性状态】\n{}\n\n【低优先级全局文风补充】\n{}",
         protagonist_rule_pack(),
         format_repair_contract(plan, target_indexes.as_ref(), &failed_obligation_ids),
         prompt_context_or_none(continuity_json),
-        prompt_context_or_none(style_prompt)
+        style_prompt
     )
 }
 

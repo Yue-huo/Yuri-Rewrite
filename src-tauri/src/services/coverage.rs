@@ -86,7 +86,10 @@ fn split_coverage_evidence(evidence: &str) -> Vec<String> {
     let mut current = String::new();
     for character in evidence.chars() {
         if character.is_whitespace()
-            || matches!(character, '。' | '！' | '？' | '!' | '?' | '；' | ';')
+            || matches!(
+                character,
+                '。' | '！' | '？' | '!' | '?' | '；' | ';' | '…' | '⋯' | '.' | '．'
+            )
         {
             let normalized = normalize_coverage_evidence(&current);
             if normalized.chars().count() >= 4 {
@@ -560,6 +563,24 @@ mod tests {
         item.evidence = "虫猿：‘她是女神！’；概括：‘不存在的第二段证据’；概括：‘不存在的第三段证据’"
             .to_string();
         assert!(!evidence_exists_in_rewrite(&item, &rewrites));
+    }
+
+    #[test]
+    fn coverage_evidence_splits_unquoted_ellipsis_separated_excerpts() {
+        let rewrites = vec![ParsedChapterRewrite {
+            id: "chapter-3".to_string(),
+            index: 3,
+            title: "第三章".to_string(),
+            text: "大叔眼里涌出不加掩饰的心疼和怜悯。姑娘，你身体不好可别省着。她笑得像是个脸色苍白却带着狡黠的少女。".to_string(),
+        }];
+        let item = ReviewCoverageItem {
+            obligation_id: "O-1".to_string(),
+            status: "satisfied".to_string(),
+            chapter_indexes: vec![3],
+            evidence: "眼里涌出不加掩饰的心疼和怜悯……姑娘，你身体不好可别省着……笑得像是个脸色苍白却带着狡黠的少女".to_string(),
+        };
+
+        assert!(evidence_exists_in_rewrite(&item, &rewrites));
     }
 
     #[test]
