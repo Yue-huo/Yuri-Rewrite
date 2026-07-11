@@ -1693,6 +1693,18 @@ textarea:focus-visible {
   min-height: 180px;
 }
 
+.system-canon-preview {
+  font-family: "Cascadia Mono", "Microsoft YaHei UI", monospace;
+  line-height: 1.65;
+  margin: 0;
+  max-height: 480px;
+  min-height: 180px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  padding: 14px;
+  white-space: pre-wrap;
+}
+
 .estimate-panel {
   background: #fff;
   border: 1px solid #ded9ce;
@@ -3950,6 +3962,7 @@ mark.search-match.active-search-match {
 
 .full-log-item pre,
 .compare-grid pre,
+.system-canon-preview,
 .canon-panel textarea,
 .asset-stack textarea {
   background: #fffaf2;

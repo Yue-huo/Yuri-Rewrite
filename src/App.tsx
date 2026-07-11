@@ -82,6 +82,7 @@ import type {
   UpdateCheckResult,
   UpdateProgress
 } from "./types";
+import { formatSystemCanonAsset, systemManagedCanonKinds } from "./canonDisplay";
 import { type AutoRunProgress, useAutoRunProgress } from "./useAutoRunProgress";
 import {
   autoContinueDelaySeconds,
@@ -134,7 +135,6 @@ const savedApiKeyMask = "********";
 const quickStartSeenKey = "yuri-rewrite.quick-start-seen";
 const themePreferenceKey = "yuri-rewrite.theme";
 const qualityIgnoreKeyPrefix = "yuri-rewrite.qualityIgnored.v1.";
-const systemManagedCanonKinds = new Set(["主角性别影响图", "改写连续性状态"]);
 const resetAppSettings: AppSettings = {
   export_dir: null,
   core_prompt: "",
@@ -3073,12 +3073,18 @@ export default function App() {
                 {detail?.canon_assets.map((asset) => (
                   <label key={asset.kind}>
                     {asset.kind}{systemManagedCanonKinds.has(asset.kind) ? "（系统只读）" : ""}
-                    <textarea
-                      value={asset.content}
-                      onChange={(event) => updateCanon(asset.kind, event.target.value)}
-                      placeholder={systemManagedCanonKinds.has(asset.kind) ? "由分析、规划和覆盖复检自动维护。" : "分析后会自动生成，也可以手动补充。"}
-                      disabled={processingTaskActive || systemManagedCanonKinds.has(asset.kind)}
-                    />
+                    {systemManagedCanonKinds.has(asset.kind) ? (
+                      <pre className="system-canon-preview" tabIndex={0}>
+                        {formatSystemCanonAsset(asset.kind, asset.content)}
+                      </pre>
+                    ) : (
+                      <textarea
+                        value={asset.content}
+                        onChange={(event) => updateCanon(asset.kind, event.target.value)}
+                        placeholder="分析后会自动生成，也可以手动补充。"
+                        disabled={processingTaskActive}
+                      />
+                    )}
                   </label>
                 ))}
               </div>

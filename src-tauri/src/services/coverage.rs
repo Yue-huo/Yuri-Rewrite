@@ -30,12 +30,48 @@ pub(crate) fn evidence_exists_in_rewrite(
             return true;
         }
 
+        let quoted_fragments = extract_quoted_coverage_evidence(evidence);
+        if !quoted_fragments.is_empty() {
+            let required_matches = (quoted_fragments.len() * 2).div_ceil(3);
+            let matched = quoted_fragments
+                .iter()
+                .filter(|fragment| normalized_rewrite.contains(fragment.as_str()))
+                .count();
+            if matched >= required_matches {
+                return true;
+            }
+        }
+
         let fragments = split_coverage_evidence(evidence);
         fragments.len() > 1
             && fragments
                 .iter()
                 .all(|fragment| normalized_rewrite.contains(fragment))
     })
+}
+
+fn extract_quoted_coverage_evidence(evidence: &str) -> Vec<String> {
+    let mut fragments = Vec::new();
+    for (open, close) in [('“', '”'), ('‘', '’'), ('"', '"'), ('\'', '\'')] {
+        let mut start = None;
+        for (index, character) in evidence.char_indices() {
+            if character == open && start.is_none() {
+                start = Some(index + character.len_utf8());
+            } else if character == close {
+                if let Some(start_index) = start.take() {
+                    let normalized = normalize_coverage_evidence(&evidence[start_index..index]);
+                    if normalized.chars().count() >= 4 {
+                        fragments.push(normalized);
+                    }
+                } else if open == close {
+                    start = Some(index + character.len_utf8());
+                }
+            }
+        }
+    }
+    fragments.sort();
+    fragments.dedup();
+    fragments
 }
 
 fn normalize_coverage_evidence(text: &str) -> String {
@@ -497,6 +533,29 @@ mod tests {
         assert!(evidence_exists_in_rewrite(&item, &rewrites));
 
         item.evidence.push_str("；管理员主动送给她一份礼物");
+        assert!(!evidence_exists_in_rewrite(&item, &rewrites));
+    }
+
+    #[test]
+    fn coverage_evidence_accepts_two_thirds_exact_quotes_and_rejects_a_weak_match() {
+        let rewrites = vec![ParsedChapterRewrite {
+            id: "chapter-5".to_string(),
+            index: 5,
+            title: "第五章".to_string(),
+            text: "她说：‘她是女神！’随后俯下身，长发如瀑布般垂落。".to_string(),
+        }];
+        let mut item = ReviewCoverageItem {
+            obligation_id: "O-1".to_string(),
+            status: "satisfied".to_string(),
+            chapter_indexes: vec![5],
+            evidence: "虫猿：‘她是女神！’；旁白：‘俯下身，长发如瀑布般垂落’；概括：‘不存在的第三段证据’"
+                .to_string(),
+        };
+
+        assert!(evidence_exists_in_rewrite(&item, &rewrites));
+
+        item.evidence = "虫猿：‘她是女神！’；概括：‘不存在的第二段证据’；概括：‘不存在的第三段证据’"
+            .to_string();
         assert!(!evidence_exists_in_rewrite(&item, &rewrites));
     }
 

@@ -1,6 +1,6 @@
 use crate::domain::{ActiveShardProgress, AppState, Chapter, Job, JobProgress};
 use crate::task_control::AutoRunProgressState;
-use crate::{load_job, row_to_job, to_string, update_job};
+use crate::{load_job, row_to_job, to_string, update_job, QUALITY_GATE_PREFIX};
 use rusqlite::params;
 use std::collections::HashSet;
 use tauri::{Emitter, State};
@@ -99,6 +99,7 @@ pub(crate) fn finalize_standalone_job_failure(
     phase: &str,
     error: &str,
 ) -> Result<Job, String> {
+    let user_error = user_facing_job_error(error);
     let status_column = match phase {
         "analysis" => "analysis_status",
         "rewrite" => "rewrite_status",
@@ -127,7 +128,7 @@ pub(crate) fn finalize_standalone_job_failure(
         },
         Err(lock_error) => finalization_errors.push(to_string(lock_error)),
     }
-    if let Err(job_error) = update_job(state, &job.id, "failed", 0, error) {
+    if let Err(job_error) = update_job(state, &job.id, "failed", 0, &user_error) {
         finalization_errors.push(job_error);
     }
     if let Err(progress_error) = clear_job_progress(state, novel_id, &job.id) {
@@ -137,10 +138,14 @@ pub(crate) fn finalize_standalone_job_failure(
         load_job(state, &job.id)
     } else {
         Err(format!(
-            "{error}；任务失败收尾不完整：{}",
+            "{user_error}；任务失败收尾不完整：{}",
             finalization_errors.join("；")
         ))
     }
+}
+
+fn user_facing_job_error(error: &str) -> String {
+    error.replace(QUALITY_GATE_PREFIX, "质量门未通过：")
 }
 
 pub(crate) fn set_auto_progress_shard_total(
@@ -370,4 +375,22 @@ fn emit_auto_runtime_progress(state: &State<'_, AppState>, novel_id: &str) -> Re
     };
     let _ = state.app.emit("job-progress", payload);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_quality_gate_marker_is_not_exposed_in_job_messages() {
+        let message = user_facing_job_error(
+            "第1-10章：__YURI_QUALITY_GATE__:分片第三次覆盖审查仍未通过",
+        );
+
+        assert_eq!(
+            message,
+            "第1-10章：质量门未通过：分片第三次覆盖审查仍未通过"
+        );
+        assert!(!message.contains("__YURI_"));
+    }
 }
