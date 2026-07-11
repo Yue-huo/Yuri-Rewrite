@@ -289,13 +289,16 @@ fn state_identity_signature(state: &RewriteStateUpdate) -> (String, String, i64,
 
 fn unique_planned_states(plan: &RewritePlan) -> Vec<&RewriteStateUpdate> {
     let mut seen = HashSet::new();
-    plan.planned_state_updates
-        .iter()
-        .chain(
-            plan.obligations
-                .iter()
-                .flat_map(|obligation| obligation.planned_state_updates.iter()),
-        )
+    let states = if plan.planned_state_updates.is_empty() {
+        plan.obligations
+            .iter()
+            .flat_map(|obligation| obligation.planned_state_updates.iter())
+            .collect::<Vec<_>>()
+    } else {
+        plan.planned_state_updates.iter().collect::<Vec<_>>()
+    };
+    states
+        .into_iter()
         .filter(|state| seen.insert(state_signature(state)))
         .collect()
 }
@@ -663,6 +666,50 @@ mod tests {
         assert_eq!(actual, vec![expected]);
         assert!(validate_state_updates(&plan, &actual).is_empty());
         assert_eq!(validate_state_updates(&plan, &[]).len(), 1);
+    }
+
+    #[test]
+    fn top_level_planned_states_supersede_obligation_intermediate_states() {
+        let early = RewriteStateUpdate {
+            thread_key: "陈熙友谊线".to_string(),
+            state_type: "互动模式".to_string(),
+            value: "陈熙开始像保护闺蜜一样维护主角".to_string(),
+            chapter_index: 5,
+            source_obligation_ids: vec!["O-5".to_string()],
+        };
+        let final_state = RewriteStateUpdate {
+            thread_key: "陈熙友谊线".to_string(),
+            state_type: "互动模式".to_string(),
+            value: "女性闺蜜间的调侃、照顾和亲密".to_string(),
+            chapter_index: 7,
+            source_obligation_ids: vec!["O-5".to_string(), "O-7".to_string()],
+        };
+        let obligation = |id: &str, chapter_index: i64, states: Vec<RewriteStateUpdate>| {
+            RewriteObligation {
+                obligation_id: id.to_string(),
+                node_id: format!("N-{chapter_index}"),
+                chapter_index,
+                rule_ids: Vec::new(),
+                preserve: Vec::new(),
+                required_changes: Vec::new(),
+                deep_delta_categories: Vec::new(),
+                forbidden_regressions: Vec::new(),
+                downstream_effects: Vec::new(),
+                planned_state_updates: states,
+            }
+        };
+        let plan = RewritePlan {
+            plan_version: "protagonist-graph-v1".to_string(),
+            graph_additions: Vec::new(),
+            obligations: vec![
+                obligation("O-5", 5, vec![early]),
+                obligation("O-7", 7, vec![final_state.clone()]),
+            ],
+            planned_state_updates: vec![final_state.clone()],
+            cross_shard_dependencies: Vec::new(),
+        };
+
+        assert!(validate_state_updates(&plan, &[final_state]).is_empty());
     }
 
     #[test]

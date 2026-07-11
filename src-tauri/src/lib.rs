@@ -4965,7 +4965,7 @@ fn build_graph_review_decision_prompt(
 3. 姓名、代词、称谓或外貌变化不能单独证明义务满足；partial、missed、regressed 一律 blocking。
 4. coverage.evidence 必须逐字引用当前改写稿中真实存在的短证据；不得引用原文、契约或自行概括。
 5. 剧情、结果、能力、身份、关系性质、marker、边界或连续性回归均为 blocking。
-6. state_updates 必须逐字段原样复制契约 planned_state_updates（包括 value），只报告本稿确实建立且可供后文使用的状态；不得概括、改写或新增状态。
+6. state_updates 只逐字段原样复制契约对象最外层 planned_state_updates（包括 value）；不要重复 obligations[].planned_state_updates 中已被后续状态覆盖的中间状态。只报告本稿确实建立且可供后文使用的状态，不得概括、改写或新增状态。
 
 输出结构：
 {{
