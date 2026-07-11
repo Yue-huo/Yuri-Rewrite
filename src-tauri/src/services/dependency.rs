@@ -18,6 +18,39 @@ fn dependency_token(value: &str) -> &str {
     value
 }
 
+fn is_thread_dependency(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("thread:") || value.starts_with("thread_key:")
+}
+
+fn normalized_thread_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn fuzzy_prior_thread_owners(
+    dependency: &str,
+    shard_index: usize,
+    thread_owners: &HashMap<String, BTreeSet<usize>>,
+) -> BTreeSet<usize> {
+    let dependency = normalized_thread_key(dependency);
+    let minimum_length = if dependency.is_ascii() { 4 } else { 2 };
+    if dependency.chars().count() < minimum_length {
+        return BTreeSet::new();
+    }
+    thread_owners
+        .iter()
+        .filter(|(thread, _)| {
+            let thread = normalized_thread_key(thread);
+            thread.contains(&dependency) || dependency.contains(&thread)
+        })
+        .flat_map(|(_, owners)| owners.range(..shard_index).copied())
+        .collect()
+}
+
 fn add_edge(edges: &mut [HashSet<usize>], from: usize, to: usize) -> Result<(), String> {
     if from == to {
         return Err(format!("分片 {} 声明了指向自身的跨分片依赖。", to + 1));
@@ -107,6 +140,7 @@ pub(crate) fn build_dependency_levels(
     for (shard_index, plan) in plans.iter().enumerate() {
         for raw_dependency in &plan.cross_shard_dependencies {
             let dependency = dependency_token(raw_dependency);
+            let thread_dependency = is_thread_dependency(raw_dependency);
             if dependency.is_empty() {
                 return Err(format!("分片 {} 包含空的跨分片依赖。", shard_index + 1));
             }
@@ -139,15 +173,36 @@ pub(crate) fn build_dependency_levels(
                             .copied()
                             .or_else(|| owners.iter().copied().find(|owner| *owner != shard_index))
                     })
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "分片 {} 引用了无法解析的跨分片依赖：{}",
-                        shard_index + 1,
-                        raw_dependency
-                    )
-                })?;
-            add_edge(&mut edges, owner, shard_index)?;
+                });
+            if let Some(owner) = owner {
+                add_edge(&mut edges, owner, shard_index)?;
+                continue;
+            }
+            if thread_dependency {
+                let fuzzy_owners = fuzzy_prior_thread_owners(
+                    dependency,
+                    shard_index,
+                    &thread_owners,
+                );
+                if fuzzy_owners.is_empty() {
+                    // A model may abbreviate a prior thread despite being told to copy its stable
+                    // key. Waiting for every earlier shard is conservative: it preserves ordering
+                    // without pretending the abbreviation identifies a specific relationship.
+                    for owner in 0..shard_index {
+                        add_edge(&mut edges, owner, shard_index)?;
+                    }
+                } else {
+                    for owner in fuzzy_owners {
+                        add_edge(&mut edges, owner, shard_index)?;
+                    }
+                }
+                continue;
+            }
+            return Err(format!(
+                "分片 {} 引用了无法解析的跨分片依赖：{}",
+                shard_index + 1,
+                raw_dependency
+            ));
         }
     }
 
@@ -277,6 +332,28 @@ mod tests {
         ];
 
         assert_eq!(build_dependency_levels(&plans, &[]).unwrap(), vec![0, 0]);
+    }
+
+    #[test]
+    fn abbreviated_thread_dependency_matches_a_prior_stable_thread() {
+        let plans = vec![
+            plan(0, &[], "许纸与吉尔伽美什的师徒/神人关系线"),
+            plan(1, &[], ""),
+            plan(2, &["thread:师徒"], "主角-吉尔伽美什关系线"),
+        ];
+
+        assert_eq!(build_dependency_levels(&plans, &[]).unwrap(), vec![0, 0, 1]);
+    }
+
+    #[test]
+    fn unknown_thread_dependency_conservatively_waits_for_all_prior_shards() {
+        let plans = vec![
+            plan(0, &[], ""),
+            plan(1, &[], ""),
+            plan(2, &["thread:模型自行概括的关系"], ""),
+        ];
+
+        assert_eq!(build_dependency_levels(&plans, &[]).unwrap(), vec![0, 0, 1]);
     }
 
     #[test]
