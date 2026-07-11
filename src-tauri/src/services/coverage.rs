@@ -35,7 +35,7 @@ pub(crate) fn evidence_exists_in_rewrite(
             let required_matches = (quoted_fragments.len() * 2).div_ceil(3);
             let matched = quoted_fragments
                 .iter()
-                .filter(|fragment| normalized_rewrite.contains(fragment.as_str()))
+                .filter(|fragment| coverage_fragment_exists(&normalized_rewrite, fragment))
                 .count();
             if matched >= required_matches {
                 return true;
@@ -46,8 +46,60 @@ pub(crate) fn evidence_exists_in_rewrite(
         fragments.len() > 1
             && fragments
                 .iter()
-                .all(|fragment| normalized_rewrite.contains(fragment))
+                .all(|fragment| coverage_fragment_exists(&normalized_rewrite, fragment))
     })
+}
+
+fn coverage_fragment_exists(normalized_rewrite: &str, fragment: &str) -> bool {
+    if normalized_rewrite.contains(fragment) {
+        return true;
+    }
+    let needle = fragment.chars().collect::<Vec<_>>();
+    if needle.len() < 8 {
+        return false;
+    }
+    let haystack = normalized_rewrite.chars().collect::<Vec<_>>();
+    let minimum = needle.len().saturating_sub(1);
+    let maximum = needle.len() + 1;
+    (minimum..=maximum).any(|window_length| {
+        window_length > 0
+            && window_length <= haystack.len()
+            && haystack
+                .windows(window_length)
+                .any(|window| within_one_edit(window, &needle))
+    })
+}
+
+fn within_one_edit(left: &[char], right: &[char]) -> bool {
+    if left.len().abs_diff(right.len()) > 1 {
+        return false;
+    }
+    if left.len() == right.len() {
+        return left
+            .iter()
+            .zip(right)
+            .filter(|(left, right)| left != right)
+            .count()
+            <= 1;
+    }
+    let (shorter, longer) = if left.len() < right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let (mut short_index, mut long_index, mut skipped) = (0, 0, false);
+    while short_index < shorter.len() && long_index < longer.len() {
+        if shorter[short_index] == longer[long_index] {
+            short_index += 1;
+            long_index += 1;
+        } else if skipped {
+            return false;
+        } else {
+            skipped = true;
+            long_index += 1;
+        }
+    }
+    true
 }
 
 fn extract_quoted_coverage_evidence(evidence: &str) -> Vec<String> {
@@ -578,6 +630,24 @@ mod tests {
             status: "satisfied".to_string(),
             chapter_indexes: vec![3],
             evidence: "眼里涌出不加掩饰的心疼和怜悯……姑娘，你身体不好可别省着……笑得像是个脸色苍白却带着狡黠的少女".to_string(),
+        };
+
+        assert!(evidence_exists_in_rewrite(&item, &rewrites));
+    }
+
+    #[test]
+    fn coverage_evidence_tolerates_one_character_transcription_drift() {
+        let rewrites = vec![ParsedChapterRewrite {
+            id: "chapter-1".to_string(),
+            index: 1,
+            title: "第一章".to_string(),
+            text: "她吃力地拖着行李箱一路上气不接下气，细瘦的手臂几乎拽不动轮子。用清秀的字迹记录进程。".to_string(),
+        }];
+        let item = ReviewCoverageItem {
+            obligation_id: "O-1".to_string(),
+            status: "satisfied".to_string(),
+            chapter_indexes: vec![1],
+            evidence: "吃力地拖着行李箱一路上气不接上气，细瘦的手臂几乎拽不动轮子；她用清秀的字迹记录进程".to_string(),
         };
 
         assert!(evidence_exists_in_rewrite(&item, &rewrites));

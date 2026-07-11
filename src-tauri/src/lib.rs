@@ -2296,6 +2296,15 @@ async fn review_rewrite_shard_strict(
     rewrite_plan: Option<&RewritePlan>,
     tagged_check: bool,
 ) -> Result<Vec<ParsedChapterRewrite>, String> {
+    let mut rewrite_shard = rewrite_shard;
+    correct_mixed_group_pronouns_before_review(
+        state,
+        novel_id,
+        &rewrite_profile.id,
+        shard_label,
+        shard,
+        &mut rewrite_shard,
+    )?;
     let repair_continuity = rewrite_plan
         .map(|plan| {
             services::contracts::load_relevant_graph_context(state, novel_id, shard, plan)
@@ -2342,7 +2351,7 @@ async fn review_rewrite_shard_strict(
         &first_decision,
         &repair_continuity,
     );
-    let revised = services::repair::repair_reviewed_shard(
+    let mut revised = services::repair::repair_reviewed_shard(
         state,
         services::repair::ReviewRepairContext {
             novel_id,
@@ -2360,6 +2369,14 @@ async fn review_rewrite_shard_strict(
         },
     )
     .await?;
+    correct_mixed_group_pronouns_before_review(
+        state,
+        novel_id,
+        &rewrite_profile.id,
+        shard_label,
+        shard,
+        &mut revised,
+    )?;
     let second_label = format!("{} · 第二次审查", shard_label);
     report_auto_shard_phase(state, novel_id, progress_shard_index, "review")?;
     let second_decision = review_revised_shard(
@@ -2399,7 +2416,7 @@ async fn review_rewrite_shard_strict(
         &second_decision,
         &repair_continuity,
     );
-    let second_revised = services::repair::repair_reviewed_shard(
+    let mut second_revised = services::repair::repair_reviewed_shard(
         state,
         services::repair::ReviewRepairContext {
             novel_id,
@@ -2417,6 +2434,14 @@ async fn review_rewrite_shard_strict(
         },
     )
     .await?;
+    correct_mixed_group_pronouns_before_review(
+        state,
+        novel_id,
+        &rewrite_profile.id,
+        shard_label,
+        shard,
+        &mut second_revised,
+    )?;
     let third_label = format!("{} · 第三次审查", shard_label);
     report_auto_shard_phase(state, novel_id, progress_shard_index, "final_review")?;
     let third_decision = review_revised_shard(
@@ -3120,7 +3145,7 @@ fn build_targeted_revision_prompt(
 - 核心设定：{}
 - 高级设定：{}
 - 保留原章节顺序、原文主线、因果、战力、伏笔、人物动机和目标章节 marker。
-- 先修复 blocking 问题，再逐项核对核心设定中“本次修复所需契约”的全部 required_changes 及其分号分隔子要求；缺少的动作、心理、他人反应、互动边界或连续性细节必须在本次一并补齐。不得只满足一个例子就跳过同一义务的其他要求，也不得改坏已合格内容。未指定性转角色保持原文性别；主角与男性共同被指代或群体含男性成员时使用“他们”或准确群体称呼，只有全员女性时才使用“她们”；性别不明的动物、灵兽等非人生物保留原文代词可通过。
+- 先修复 blocking 问题，再逐项核对核心设定中“本次修复所需契约”的全部 required_changes 及其分号分隔硬要求；缺少的动作、心理、他人反应、互动边界或连续性细节必须在本次一并补齐。不得只满足一项硬要求就跳过同一义务的其他要求，也不得改坏已合格内容。“可能、可以、例如、比如、如”等词引出的内容是可选实现参考，不要求逐字或全部采用；应实现其前面的深层变化目标。未指定性转角色保持原文性别；主角与男性共同被指代或群体含男性成员时使用“他们”或准确群体称呼，只有全员女性时才使用“她们”；性别不明的动物、灵兽等非人生物保留原文代词可通过。
 - {}
 - 每个目标章节必须完整输出原 `<<<YURI_REWRITE_CHAPTER_START ...>>>` 和 `<<<YURI_REWRITE_CHAPTER_END ...>>>`，marker 的 index 和 id 逐字复制。
 - 只输出目标章节的 marker、标题、正文；不要解释、不要 Markdown。
@@ -4331,6 +4356,76 @@ fn detect_mixed_group_pronoun_regressions(
     issues
 }
 
+fn correct_unambiguous_mixed_group_pronouns(
+    chapters: &[Chapter],
+    rewrites: &mut [ParsedChapterRewrite],
+) -> usize {
+    let chapters_by_id = chapters
+        .iter()
+        .map(|chapter| (chapter.id.as_str(), chapter))
+        .collect::<HashMap<_, _>>();
+    let replacements = [("他们家", "她们家"), ("他们一家", "她们一家")];
+    let male_family_terms = [
+        "父亲", "父母", "爸爸", "爸妈", "儿子", "兄弟", "哥哥", "弟弟", "丈夫", "爷爷",
+        "叔叔", "伯伯",
+    ];
+    let mut corrected = 0;
+    for rewrite in rewrites {
+        let Some(chapter) = chapters_by_id.get(rewrite.id.as_str()) else {
+            continue;
+        };
+        let sentences = split_review_sentences(&chapter.original_text);
+        for (source, target) in replacements {
+            if chapter.original_text.matches(source).count() != 1
+                || rewrite.text.matches(target).count() != 1
+            {
+                continue;
+            }
+            let mixed_family_context = sentences.iter().enumerate().any(|(index, sentence)| {
+                if !sentence.contains(source) {
+                    return false;
+                }
+                let start = index.saturating_sub(1);
+                let end = (index + 2).min(sentences.len());
+                contains_any(&sentences[start..end].join(""), &male_family_terms)
+            });
+            if mixed_family_context {
+                rewrite.text = rewrite.text.replacen(target, source, 1);
+                corrected += 1;
+            }
+        }
+    }
+    corrected
+}
+
+fn correct_mixed_group_pronouns_before_review(
+    state: &State<'_, AppState>,
+    novel_id: &str,
+    profile_id: &str,
+    shard_label: &str,
+    chapters: &[Chapter],
+    rewrites: &mut [ParsedChapterRewrite],
+) -> Result<(), String> {
+    let corrected = correct_unambiguous_mixed_group_pronouns(chapters, rewrites);
+    if corrected > 0 {
+        append_ai_log(
+            state,
+            Some(novel_id),
+            profile_id,
+            "本地确定性群体代词修正",
+            Some(shard_label),
+            "success",
+            &format!(
+                "在送入质量门前修正了 {} 处可由原文唯一确定的“他们家/他们一家”误女性化，未消耗模型调用。",
+                corrected
+            ),
+            None,
+            None,
+        )?;
+    }
+    Ok(())
+}
+
 fn build_targeted_revision_context(
     shard: &[Chapter],
     rewrites: &[ParsedChapterRewrite],
@@ -4961,7 +5056,7 @@ fn build_graph_review_decision_prompt(
 
 审批硬条件：
 1. 契约中的每个 obligation_id 必须在 coverage 中恰好出现一次，不能出现未知义务。
-2. 逐项比较原文、契约和当前改写稿；必须拆开核对每个 required_changes 数组项及其中由分号分隔的各项动作、心理、他人反应、互动边界和连续性子要求。只有所有实质子要求都有正文证据时，status 才能是 satisfied；不得因为命中其中一个例子就批准整项义务。
+2. 逐项比较原文、契约和当前改写稿；必须拆开核对每个 required_changes 数组项及其中由分号分隔的各项动作、心理、他人反应、互动边界和连续性硬要求。只有所有实质硬要求都有正文证据时，status 才能是 satisfied。“可能、可以、例如、比如、如”等词引出的内容只是可选实现参考，不要求逐字或全部出现；应验收其前面的深层变化目标。不得因为命中一项硬要求就批准整项义务。
 3. 姓名、代词、称谓或外貌变化不能单独证明义务满足；partial、missed、regressed 一律 blocking。
 4. coverage.evidence 必须逐字引用当前改写稿中真实存在的短证据；同一义务有多个实质子要求时，用中文分号分隔对应的多段短引用。不得引用原文、契约、自行概括或用省略号拼接成不存在的连续句。
 5. 剧情、结果、能力、身份、关系性质、marker、边界或连续性回归均为 blocking。
@@ -9671,6 +9766,29 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert!(review_issue_text(&issues[0]).contains("她们家"));
         assert!(review_issue_text(&issues[0]).contains("她家"));
+    }
+
+    #[test]
+    fn unambiguous_mixed_family_pronoun_is_corrected_without_a_model_call() {
+        let chapter = sample_chapter(
+            1,
+            "第一章",
+            "他们家在村里原先算是有矿。后来生意亏损，父母也气得倒下了。",
+        );
+        let mut rewrites = vec![ParsedChapterRewrite {
+            id: chapter.id.clone(),
+            index: chapter.index,
+            title: chapter.title.clone(),
+            text: "她们家在村里原先算是有矿。后来生意亏损，父母也气得倒下了。"
+                .to_string(),
+        }];
+
+        assert_eq!(
+            correct_unambiguous_mixed_group_pronouns(&[chapter], &mut rewrites),
+            1
+        );
+        assert!(rewrites[0].text.contains("他们家"));
+        assert!(!rewrites[0].text.contains("她们家"));
     }
 
     #[test]

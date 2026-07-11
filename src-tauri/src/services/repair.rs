@@ -144,7 +144,7 @@ pub(crate) fn build_repair_core_prompt(
         crate::truncate_text(style_prompt.trim(), 2_000)
     };
     format!(
-        "【修复完整性要求】\n修复已列出的 blocking 问题后，必须重新逐项核对本次修复契约中的每个 required_changes 及其分号分隔子要求；发现当前稿仍缺少的动作、心理、他人反应、互动边界或连续性细节时一并补齐。不得只满足其中一个例子就认定整项义务完成，也不得破坏已合格内容。\n\n{}\n\n【本次修复所需契约】\n{}\n\n【相关已通过连续性状态】\n{}\n\n【低优先级全局文风补充】\n{}",
+        "【修复完整性要求】\n修复已列出的 blocking 问题后，必须重新逐项核对本次修复契约中的每个 required_changes 及其分号分隔的硬性子要求；发现当前稿仍缺少的动作、心理、他人反应、互动边界或连续性细节时一并补齐。不得只满足其中一项硬要求就认定整项义务完成，也不得破坏已合格内容。由“可能、可以、例如、比如、如”等词引出的内容只表示可选实现方式，不要求逐字采用或全部出现；应验收并实现其前面的深层变化目标。\n\n{}\n\n【本次修复所需契约】\n{}\n\n【相关已通过连续性状态】\n{}\n\n【低优先级全局文风补充】\n{}",
         protagonist_rule_pack(),
         format_repair_contract(plan, target_indexes.as_ref(), &failed_obligation_ids),
         prompt_context_or_none(continuity_json),
