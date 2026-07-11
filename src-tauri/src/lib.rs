@@ -3443,6 +3443,10 @@ fn detect_protagonist_derived_name_residue(
         .iter()
         .map(|rewrite| (rewrite.id.as_str(), rewrite))
         .collect::<HashMap<_, _>>();
+    let rewritten_candidates =
+        protagonist_derived_name_candidates(settings.rewritten_protagonist_name.trim())
+            .into_iter()
+            .collect::<HashSet<_>>();
     let mut issues = Vec::new();
     for chapter in chapters {
         let Some(rewrite) = rewrite_by_id.get(chapter.id.as_str()) else {
@@ -3453,6 +3457,7 @@ fn detect_protagonist_derived_name_residue(
             .flat_map(|source_name| {
                 protagonist_residue_candidates_from_original(chapter, source_name)
             })
+            .filter(|candidate| !rewritten_candidates.contains(candidate))
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             continue;
@@ -9612,6 +9617,31 @@ mod tests {
         assert!(text.contains("昊叔"));
         let candidates = protagonist_residue_candidates_from_original(&chapter, "石昊");
         assert!(!candidates.iter().any(|candidate| candidate == "昊"));
+    }
+
+    #[test]
+    fn protagonist_residue_scan_allows_nickname_shared_with_rewritten_name() {
+        let chapter = sample_chapter(
+            5,
+            "第五章",
+            "许纸回村后，李婶招呼道：小纸，快来坐。",
+        );
+        let rewrite = ParsedChapterRewrite {
+            id: chapter.id.clone(),
+            index: chapter.index,
+            title: chapter.title.clone(),
+            text: "白纸回村后，李婶招呼道：小纸，快来坐。".to_string(),
+        };
+        let mut settings = sample_novel_settings();
+        settings.protagonist_name = "许纸".to_string();
+        settings.rewritten_protagonist_name = "白纸".to_string();
+
+        assert!(detect_protagonist_derived_name_residue(
+            std::slice::from_ref(&chapter),
+            std::slice::from_ref(&rewrite),
+            &settings,
+        )
+        .is_empty());
     }
 
     #[test]

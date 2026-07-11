@@ -82,7 +82,7 @@ pub(crate) async fn plan_rewrite_shard(
         Some(&output.raw_response),
     )?;
 
-    let plan = match parse_and_validate_rewrite_plan(&output.text, context.chapters, &base_nodes) {
+    let mut plan = match parse_and_validate_rewrite_plan(&output.text, context.chapters, &base_nodes) {
         Ok(plan) => plan,
         Err(error) => {
             // Keep the user's thinking preference for the substantive first pass. Only the
@@ -129,6 +129,7 @@ pub(crate) async fn plan_rewrite_shard(
         }
     };
 
+    normalize_planned_state_identity(&mut plan, context.settings);
     persist_plan_and_graph(
         state,
         context.novel_id,
@@ -144,6 +145,31 @@ pub(crate) async fn plan_rewrite_shard(
         context.batch_index,
     )?;
     Ok(plan)
+}
+
+fn normalize_planned_state_identity(plan: &mut RewritePlan, settings: &NovelSettings) {
+    let target = settings.rewritten_protagonist_name.trim();
+    if target.is_empty() {
+        return;
+    }
+    let mut sources = std::iter::once(settings.protagonist_name.as_str())
+        .chain(settings.protagonist_aliases.split(|character| {
+            matches!(character, '\n' | '\r' | ',' | '，' | '、' | ';' | '；')
+        }))
+        .map(str::trim)
+        .filter(|source| !source.is_empty() && *source != target)
+        .collect::<Vec<_>>();
+    sources.sort_by_key(|source| std::cmp::Reverse(source.chars().count()));
+    sources.dedup();
+    for state in plan.planned_state_updates.iter_mut().chain(
+        plan.obligations
+            .iter_mut()
+            .flat_map(|obligation| obligation.planned_state_updates.iter_mut()),
+    ) {
+        for source in &sources {
+            state.value = state.value.replace(source, target);
+        }
+    }
 }
 
 fn structured_repair_profile(profile: &ModelProfile) -> ModelProfile {
@@ -339,6 +365,47 @@ mod tests {
         assert_eq!(effective.id, saved.id);
         assert_eq!(effective.model, saved.model);
         assert_eq!(saved.thinking_mode, "auto");
+    }
+
+    #[test]
+    fn planned_state_values_use_target_identity_but_keep_stable_thread_keys() {
+        let state = RewriteStateUpdate {
+            thread_key: "许纸与吉尔伽美什关系线".to_string(),
+            state_type: "照顾关系".to_string(),
+            value: "陈熙每日为患癌的许纸送饭".to_string(),
+            chapter_index: 7,
+            source_obligation_ids: vec!["O-1".to_string()],
+        };
+        let mut plan = RewritePlan {
+            plan_version: "protagonist-graph-v1".to_string(),
+            graph_additions: Vec::new(),
+            obligations: vec![crate::domain::RewriteObligation {
+                obligation_id: "O-1".to_string(),
+                node_id: "N-1".to_string(),
+                chapter_index: 7,
+                rule_ids: Vec::new(),
+                preserve: Vec::new(),
+                required_changes: Vec::new(),
+                deep_delta_categories: Vec::new(),
+                forbidden_regressions: Vec::new(),
+                downstream_effects: Vec::new(),
+                planned_state_updates: vec![state.clone()],
+            }],
+            planned_state_updates: vec![state],
+            cross_shard_dependencies: Vec::new(),
+        };
+        let mut settings = settings();
+        settings.protagonist_name = "许纸".to_string();
+        settings.rewritten_protagonist_name = "白纸".to_string();
+
+        normalize_planned_state_identity(&mut plan, &settings);
+
+        assert_eq!(plan.planned_state_updates[0].thread_key, "许纸与吉尔伽美什关系线");
+        assert_eq!(plan.planned_state_updates[0].value, "陈熙每日为患癌的白纸送饭");
+        assert_eq!(
+            plan.obligations[0].planned_state_updates[0].value,
+            "陈熙每日为患癌的白纸送饭"
+        );
     }
 
     #[test]

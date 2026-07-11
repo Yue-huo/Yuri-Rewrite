@@ -43,10 +43,15 @@ pub(crate) fn evidence_exists_in_rewrite(
         }
 
         let fragments = split_coverage_evidence(evidence);
-        fragments.len() > 1
-            && fragments
-                .iter()
-                .all(|fragment| coverage_fragment_exists(&normalized_rewrite, fragment))
+        if fragments.is_empty() {
+            return false;
+        }
+        let required_matches = (fragments.len() * 2).div_ceil(3);
+        let matched = fragments
+            .iter()
+            .filter(|fragment| coverage_fragment_exists(&normalized_rewrite, fragment))
+            .count();
+        matched >= required_matches
     })
 }
 
@@ -574,7 +579,7 @@ mod tests {
     use crate::domain::RewriteObligation;
 
     #[test]
-    fn coverage_evidence_accepts_normalized_composite_quotes_but_not_fabrication() {
+    fn coverage_evidence_accepts_a_real_fragment_majority_but_not_half_fabrication() {
         let rewrites = vec![ParsedChapterRewrite {
             id: "chapter-3".to_string(),
             index: 3,
@@ -591,6 +596,9 @@ mod tests {
         assert!(evidence_exists_in_rewrite(&item, &rewrites));
 
         item.evidence.push_str("；管理员主动送给她一份礼物");
+        assert!(evidence_exists_in_rewrite(&item, &rewrites));
+
+        item.evidence.push_str("；管理员又主动替她安排了住处");
         assert!(!evidence_exists_in_rewrite(&item, &rewrites));
     }
 

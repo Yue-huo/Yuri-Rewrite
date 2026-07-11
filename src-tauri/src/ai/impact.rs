@@ -313,6 +313,7 @@ pub(crate) fn build_rewrite_plan_prompt(
 9. 阅读前序分片契约。如果当前义务依赖前序 node_id、obligation_id、thread_key 或计划状态，把前序摘要中实际出现的稳定标识逐字复制到 cross_shard_dependencies。不得引用当前分片新建的标识，也不得缩写、改名或概括前序 thread_key。该字段必须是扁平字符串数组（例如 ["obligation:O-xxx", "thread:许纸与吉尔伽美什的师徒/神人关系线"]），严禁输出对象；无依赖时返回空数组。
 10. 每个 planned_state_updates 项必须包含 thread_key、state_type、value、当前分片 chapter_index 和非空 source_obligation_ids；义务内部的状态必须把该义务自身 ID 列为来源。
 11. required_changes 只写最终必须验收的可见结果，使用简短独立数组项；不要把“可能、可以、例如、比如、如……”等可选实现示例混入硬要求。需要某个具体动作或反应时直接写成必须发生的结果。
+12. 原著影响图的 thread_key 为保持稳定可以含原主角姓名，但 planned_state_updates.value 必须使用目标改写名或“主角”，不得把原名、原名别名写进将传给后文的连续性状态。
 
 允许的深层变化类别：{}
 

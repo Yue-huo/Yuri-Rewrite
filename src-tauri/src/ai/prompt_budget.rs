@@ -166,39 +166,32 @@ pub(crate) fn format_repair_contract(
     chapter_indexes: Option<&HashSet<i64>>,
     failed_obligation_ids: &HashSet<String>,
 ) -> String {
-    if chapter_indexes.is_none() {
-        return format_execution_contract(plan, None);
-    }
     let include_chapter =
         |chapter_index: i64| chapter_indexes.is_none_or(|indexes| indexes.contains(&chapter_index));
     let obligations = plan
         .obligations
         .iter()
-        .filter(|obligation| {
-            include_chapter(obligation.chapter_index)
-                && (failed_obligation_ids.is_empty()
-                    || failed_obligation_ids.contains(&obligation.obligation_id))
-        })
+        .filter(|obligation| include_chapter(obligation.chapter_index))
         .collect::<Vec<_>>();
-    let selected_ids = obligations
+    let obligation_ids = obligations
         .iter()
         .map(|obligation| obligation.obligation_id.as_str())
         .collect::<HashSet<_>>();
+    let mut repair_target_obligation_ids = failed_obligation_ids
+        .iter()
+        .filter(|id| obligation_ids.contains(id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    repair_target_obligation_ids.sort();
     let planned_state_updates = plan
         .planned_state_updates
         .iter()
-        .filter(|state| {
-            (state.chapter_index == 0 || include_chapter(state.chapter_index))
-                && (selected_ids.is_empty()
-                    || state
-                        .source_obligation_ids
-                        .iter()
-                        .any(|id| selected_ids.contains(id.as_str())))
-        })
+        .filter(|state| state.chapter_index == 0 || include_chapter(state.chapter_index))
         .collect::<Vec<_>>();
     compact_json(
         &json!({
             "plan_version": plan.plan_version,
+            "repair_target_obligation_ids": repair_target_obligation_ids,
             "obligations": obligations,
             "planned_state_updates": planned_state_updates,
         }),
@@ -452,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_contract_keeps_only_failed_obligations_in_target_chapters() {
+    fn repair_contract_keeps_all_target_chapter_obligations_and_marks_failed_ones() {
         let make_obligation = |id: &str, chapter_index: i64| RewriteObligation {
             obligation_id: id.to_string(),
             node_id: format!("N-{id}"),
@@ -481,8 +474,9 @@ mod tests {
 
         let contract = format_repair_contract(&plan, Some(&chapters), &failed);
 
-        assert!(!contract.contains("O-1"));
+        assert!(contract.contains("O-1"));
         assert!(contract.contains("O-2"));
         assert!(!contract.contains("O-3"));
+        assert!(contract.contains("\"repair_target_obligation_ids\":[\"O-2\"]"));
     }
 }
