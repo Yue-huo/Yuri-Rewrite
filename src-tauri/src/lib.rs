@@ -67,7 +67,8 @@ const SYSTEM_ANALYSIS_EXPERT: &str = "你是严谨的中文长篇小说结构分
 const SYSTEM_ANALYSIS_JSON_REPAIR: &str = "你是中文小说分析 JSON 格式修复专家，只负责把输入修复为合法 JSON 对象，不新增事实、不改写正文、不输出 Markdown 或解释。";
 const SYSTEM_NAME_MAPPING_EXPERT: &str = "你是中文小说姓名女性化映射专家，擅长在保留姓氏、读音和人物辨识度的前提下生成稳定姓名映射。必须只输出合法 JSON，不输出 Markdown 或解释。";
 const SYSTEM_REWRITE_EXPERT: &str = "你是资深中文长篇小说改写专家，擅长在保持原文主线、人物逻辑和章节边界的前提下，将男女性别叙事自然改写为双女主百合文本。工作方式：先遵守输入中的规则、设定和一致性资产，再处理当前章节正文。输出必须只包含当前输入章节的 marker、标题和正文，不解释、不输出输入外章节。";
-const SYSTEM_REWRITE_FORMAT_REPAIR: &str = "你是中文小说改写格式修复专家，擅长修复章节边界、缺失 marker、空正文和截断式输出问题。必须重新输出当前输入章节的完整百合改写结果，逐字保留章节 marker，只输出 marker、标题和非空正文，不解释。";
+const SYSTEM_GRAPH_REWRITE_EXPERT: &str = "你是克制的中文小说性转改写专家。必须覆盖全部主角节点，但只在原文性别确实造成身体、称谓、关系或社会因果时做最小充分重构；中性节点保持原心理、动作、关系和用词。允许在身体观察或互动场景添加适量且符合设定的外貌描写，禁止用母性、柔弱、细腻或刻意女性身份标签解释行为。输出只能包含当前章节 marker、标题和正文。";
+const SYSTEM_REWRITE_FORMAT_REPAIR: &str = "你是中文小说改写格式修复专家，只修复章节边界、缺失 marker、空正文和截断式输出问题。必须保持上一版的节点模式与最小修改范围，重新输出当前输入章节的完整结果，逐字保留章节 marker，只输出 marker、标题和非空正文，不解释。";
 const SYSTEM_REVIEW_DECISION_EXPERT: &str = "你是严谨的中文小说改写审查专家，擅长依据规则核对姓名、性别、逻辑、一致性和章节边界。只判断会导致打回的 blocking 问题，不做润色，不直接改写正文。必须只输出合法 JSON。";
 const SYSTEM_REVIEW_FINAL_EXPERT: &str = "你是中文小说改写终审专家，擅长复判打回重写后的稿件是否已解决 blocking 问题。只输出合法 JSON，不解释，不补充非阻断建议。";
 const SYSTEM_REVIEW_JSON_REPAIR: &str = "你是 JSON 格式修复专家，只负责把审查决策修复为合法 JSON，不重新审查正文，不新增或删除问题，不输出解释。";
@@ -1744,7 +1745,11 @@ async fn generate_single_rewrite_shard(
         Some(state.rate_limits.clone()),
         profile,
         api_key,
-        SYSTEM_REWRITE_EXPERT,
+        if graph_strategy {
+            SYSTEM_GRAPH_REWRITE_EXPERT
+        } else {
+            SYSTEM_REWRITE_EXPERT
+        },
         &prompt,
         false,
     )
@@ -2710,11 +2715,29 @@ fn finalize_review_decision(
     shard: &[Chapter],
     rewrites: &[ParsedChapterRewrite],
     settings: &NovelSettings,
+    graph_v2: bool,
 ) -> Result<ReviewDecision, String> {
     let (decision, filtered_issues) =
         filter_review_decision_against_rewrites(decision, shard, rewrites, settings);
-    let (decision, deterministic_issues) =
+    let (mut decision, mut deterministic_issues) =
         merge_deterministic_protagonist_residue_issues(decision, shard, rewrites, settings);
+    if graph_v2 {
+        let graph_issues = detect_graph_v2_overrewrite_issues(shard, rewrites, settings);
+        if !graph_issues.is_empty() {
+            let mut existing = decision
+                .issues
+                .iter()
+                .map(review_issue_text)
+                .collect::<HashSet<_>>();
+            for issue in graph_issues {
+                if existing.insert(review_issue_text(&issue)) {
+                    deterministic_issues.push(issue.clone());
+                    decision.issues.push(issue);
+                }
+            }
+            decision.approved = decision.issues.is_empty();
+        }
+    }
     if !filtered_issues.is_empty() {
         append_ai_log(
             state,
@@ -2736,11 +2759,11 @@ fn finalize_review_decision(
             state,
             Some(novel_id),
             profile_id,
-            "本地主角残留扫描",
+            "本地身份与过度改写扫描",
             Some(shard_label),
             "warning",
             &format!(
-                "本地扫描发现改写稿仍包含主角原名或派生称呼残留，将作为 blocking 问题进入修复流程：\n{}",
+                "本地扫描发现主角残留、刻板表达、中性词/人物姓名丢失或跨章复制，将作为 blocking 问题进入修复流程：\n{}",
                 review_issues_text(&deterministic_issues)
             ),
             None,
@@ -2781,6 +2804,7 @@ fn validate_review_model_output(
         shard,
         rewrites,
         settings,
+        rewrite_plan.is_some(),
     )?;
     if let Some(plan) = rewrite_plan {
         persist_rewrite_review_result(
@@ -3145,7 +3169,7 @@ fn build_targeted_revision_prompt(
 - 核心设定：{}
 - 高级设定：{}
 - 保留原章节顺序、原文主线、因果、战力、伏笔、人物动机和目标章节 marker。
-- 先修复 blocking 问题，再逐项核对核心设定中“本次修复所需契约”的全部 required_changes 及其分号分隔硬要求；缺少的动作、心理、他人反应、互动边界或连续性细节必须在本次一并补齐。不得只满足一项硬要求就跳过同一义务的其他要求，也不得改坏已合格内容。“可能、可以、例如、比如、如”等词引出的内容是可选实现参考，不要求逐字或全部采用；应实现其前面的深层变化目标。未指定性转角色保持原文性别；主角与男性共同被指代或群体含男性成员时使用“他们”或准确群体称呼，只有全员女性时才使用“她们”；性别不明的动物、灵兽等非人生物保留原文代词可通过。
+- 先修复 blocking 问题，再按契约模式逐项核对：R3_CAUSAL_TRANSFORM / R3_DERIVED_TRANSFORM 只补齐 required_changes 中有证据的最小变化；R3_SURFACE_ADAPT 只做身份、称谓、身体或场景相关外貌适配；R3_PRESERVE 必须恢复中性原意，不得补写心理、反应或关系变化。适量外貌描写允许保留或添加，但必须与当前身体观察、互动或即时反应直接相关，且不能推出母性、柔弱、温柔等人格。不得改坏已合格内容。未指定性转角色保持原文姓名、性别和代词；主角与男性共同被指代或群体含男性成员时使用“他们”或准确群体称呼，只有全员女性时才使用“她们”；性别不明的动物、灵兽等非人生物保留原文代词可通过。
 - {}
 - 每个目标章节必须完整输出原 `<<<YURI_REWRITE_CHAPTER_START ...>>>` 和 `<<<YURI_REWRITE_CHAPTER_END ...>>>`，marker 的 index 和 id 逐字复制。
 - 只输出目标章节的 marker、标题、正文；不要解释、不要 Markdown。
@@ -3428,6 +3452,255 @@ fn merge_deterministic_protagonist_residue_issues(
         },
         added,
     )
+}
+
+fn detect_graph_v2_overrewrite_issues(
+    chapters: &[Chapter],
+    rewrites: &[ParsedChapterRewrite],
+    settings: &NovelSettings,
+) -> Vec<ReviewIssue> {
+    let rewrite_by_id = rewrites
+        .iter()
+        .map(|rewrite| (rewrite.id.as_str(), rewrite))
+        .collect::<HashMap<_, _>>();
+    let protected_names = protected_unmapped_character_names(chapters, settings);
+    let neutral_terms = [
+        "偶像", "榜样", "英雄", "巨人", "巨兽", "强者", "造物主", "学生", "同伴",
+        "朋友", "管理员", "师父", "前辈", "对手", "敌人", "主人", "孩子", "家伙",
+        "单身狗",
+    ];
+    let stereotype_phrases = [
+        "身为女性",
+        "身为女人",
+        "身为女子",
+        "我一个女人",
+        "我一个女性",
+        "同为女子",
+        "同为女人",
+        "枉为女性",
+        "枉为女人",
+        "女性特有",
+        "女人特有",
+        "女孩子半条命",
+        "母性本能",
+        "女人就该",
+    ];
+    let mut issues = Vec::new();
+
+    for chapter in chapters {
+        let Some(rewrite) = rewrite_by_id.get(chapter.id.as_str()) else {
+            continue;
+        };
+        let original = format!("{}\n{}", chapter.title, chapter.original_text);
+        let rewritten = format!("{}\n{}", rewrite.title, rewrite.text);
+        for phrase in stereotype_phrases {
+            if !original.contains(phrase) && rewritten.contains(phrase) {
+                issues.push(ReviewIssue {
+                    chapter_indexes: vec![chapter.index],
+                    scope: "chapter".to_string(),
+                    category: "stereotype".to_string(),
+                    severity: "blocking".to_string(),
+                    problem: format!("改写稿凭空加入刻意性别标签“{phrase}”。"),
+                    required_fix: "删除性别标签并恢复人物原有动机；外貌可按场景自然描写。"
+                        .to_string(),
+                });
+            }
+        }
+        for term in neutral_terms {
+            let source_count = original.matches(term).count();
+            let rewrite_count = rewritten.matches(term).count();
+            if source_count > rewrite_count {
+                issues.push(ReviewIssue {
+                    chapter_indexes: vec![chapter.index],
+                    scope: "chapter".to_string(),
+                    category: "neutral_term".to_string(),
+                    severity: "blocking".to_string(),
+                    problem: format!(
+                        "中性词“{term}”由原文 {source_count} 次减少为 {rewrite_count} 次。"
+                    ),
+                    required_fix: format!("恢复中性词“{term}”，不得仅因主角性转而女性化。"),
+                });
+            }
+        }
+        for name in &protected_names {
+            let source_count = original.matches(name).count();
+            if source_count == 0 {
+                continue;
+            }
+            let rewrite_count = rewritten.matches(name).count();
+            if source_count > rewrite_count {
+                issues.push(ReviewIssue {
+                    chapter_indexes: vec![chapter.index],
+                    scope: "chapter".to_string(),
+                    category: "entity_name".to_string(),
+                    severity: "blocking".to_string(),
+                    problem: format!(
+                        "未映射人物姓名“{name}”由原文 {source_count} 次减少为 {rewrite_count} 次。"
+                    ),
+                    required_fix: format!("逐字恢复人物姓名“{name}”，不得改名或用代词替代。"),
+                });
+            }
+        }
+    }
+    issues.extend(detect_cross_chapter_copy_issues(chapters, rewrites));
+    issues
+}
+
+fn protected_unmapped_character_names(
+    chapters: &[Chapter],
+    settings: &NovelSettings,
+) -> HashSet<String> {
+    let mut excluded = protagonist_source_names(settings)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let rewritten = settings.rewritten_protagonist_name.trim();
+    if !rewritten.is_empty() {
+        excluded.insert(rewritten.to_string());
+    }
+    for mapping in additional_feminize_name_mappings(&settings.additional_feminize_names) {
+        excluded.insert(mapping.source);
+        excluded.insert(mapping.target);
+    }
+    excluded.extend(additional_feminize_name_sources(
+        &settings.additional_feminize_names,
+    ));
+
+    let mut names = HashSet::new();
+    for analysis in chapters
+        .iter()
+        .filter_map(|chapter| chapter.analysis_json.as_deref())
+    {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(analysis) else {
+            continue;
+        };
+        for field in ["characters", "names"] {
+            let Some(items) = value.get(field).and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for item in items {
+                let candidate = if let Some(text) = item.as_str() {
+                    text.split(['：', ':'])
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .trim_start_matches(['-', '*', '•'])
+                        .trim()
+                        .split(['（', '('])
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                } else {
+                    item.get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string()
+                };
+                let length = candidate.chars().count();
+                if (2..=16).contains(&length)
+                    && candidate
+                        .chars()
+                        .all(|character| character.is_alphanumeric() || matches!(character, '·' | '・'))
+                    && !excluded.contains(&candidate)
+                {
+                    names.insert(candidate);
+                }
+            }
+        }
+    }
+    names
+}
+
+fn detect_cross_chapter_copy_issues(
+    chapters: &[Chapter],
+    rewrites: &[ParsedChapterRewrite],
+) -> Vec<ReviewIssue> {
+    let chapter_by_id = chapters
+        .iter()
+        .map(|chapter| (chapter.id.as_str(), chapter))
+        .collect::<HashMap<_, _>>();
+    let mut issues = Vec::new();
+    for left_index in 0..rewrites.len() {
+        for right_index in (left_index + 1)..rewrites.len() {
+            let left = &rewrites[left_index];
+            let right = &rewrites[right_index];
+            let (Some(left_source), Some(right_source)) = (
+                chapter_by_id.get(left.id.as_str()),
+                chapter_by_id.get(right.id.as_str()),
+            ) else {
+                continue;
+            };
+            let left_text = normalize_copy_scan_text(&left.text);
+            let right_text = normalize_copy_scan_text(&right.text);
+            let left_original = normalize_copy_scan_text(&left_source.original_text);
+            let right_original = normalize_copy_scan_text(&right_source.original_text);
+            let copied_into_left = copied_shingle_example(
+                &left_text,
+                &right_text,
+                &left_original,
+                &right_original,
+            );
+            let copied_into_right = copied_shingle_example(
+                &right_text,
+                &left_text,
+                &right_original,
+                &left_original,
+            );
+            for (target, source, example) in [
+                (left.index, right.index, copied_into_left),
+                (right.index, left.index, copied_into_right),
+            ] {
+                if let Some(example) = example {
+                    issues.push(ReviewIssue {
+                        chapter_indexes: vec![target, source],
+                        scope: "cross_chapter".to_string(),
+                        category: "boundary".to_string(),
+                        severity: "blocking".to_string(),
+                        problem: format!(
+                            "分片 {target} 出现疑似从分片 {source} 提前复制的连续内容：“{example}”。"
+                        ),
+                        required_fix: "删除串入内容，各章只保留原章事件和必要性别适配。".to_string(),
+                    });
+                }
+            }
+        }
+    }
+    issues
+}
+
+fn normalize_copy_scan_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn copied_shingle_example(
+    target_rewrite: &str,
+    source_rewrite: &str,
+    target_original: &str,
+    source_original: &str,
+) -> Option<String> {
+    const WINDOW: usize = 32;
+    const REQUIRED_OVERLAP: usize = 3;
+    let source_chars = source_rewrite.chars().collect::<Vec<_>>();
+    if source_chars.len() < WINDOW {
+        return None;
+    }
+    let mut matches = Vec::new();
+    for window in source_chars.windows(WINDOW) {
+        let shingle = window.iter().collect::<String>();
+        if source_original.contains(&shingle)
+            && target_rewrite.contains(&shingle)
+            && !target_original.contains(&shingle)
+        {
+            matches.push(shingle);
+            if matches.len() >= REQUIRED_OVERLAP {
+                return matches.first().cloned();
+            }
+        }
+    }
+    None
 }
 
 fn detect_protagonist_derived_name_residue(
@@ -5061,11 +5334,13 @@ fn build_graph_review_decision_prompt(
 
 审批硬条件：
 1. 契约中的每个 obligation_id 必须在 coverage 中恰好出现一次，不能出现未知义务。
-2. 逐项比较原文、契约和当前改写稿；必须拆开核对每个 required_changes 数组项及其中由分号分隔的各项动作、心理、他人反应、互动边界和连续性硬要求。只有所有实质硬要求都有正文证据时，status 才能是 satisfied。“可能、可以、例如、比如、如”等词引出的内容只是可选实现参考，不要求逐字或全部出现；应验收其前面的深层变化目标。不得因为命中一项硬要求就批准整项义务。
-3. 姓名、代词、称谓或外貌变化不能单独证明义务满足；partial、missed、regressed 一律 blocking。
+2. 按 rule_ids 中的节点模式验收：R3_CAUSAL_TRANSFORM / R3_DERIVED_TRANSFORM 必须完成全部最小因果变化；R3_SURFACE_ADAPT 只验收身份、称谓、身体或场景相关外貌适配；R3_PRESERVE 必须确认原文中性心理、动作、关系、专名和措辞未被无故改写。不得要求所有节点产生深层变化。
+3. 逐项比较原文、契约和当前改写稿。required_changes 非空时必须拆开核对每个数组项及分号分隔硬要求；R3_PRESERVE 的 required_changes 应为空，正文保留证据即可 satisfied。partial、missed、regressed 一律 blocking。
 4. coverage.evidence 必须逐字引用当前改写稿中真实存在的短证据；同一义务有多个实质子要求时，用中文分号分隔对应的多段短引用。不得引用原文、契约、自行概括或用省略号拼接成不存在的连续句。
 5. 剧情、结果、能力、身份、关系性质、marker、边界或连续性回归均为 blocking。
 6. state_updates 只逐字段原样复制契约对象最外层 planned_state_updates（包括 value）；不要重复 obligations[].planned_state_updates 中已被后续状态覆盖的中间状态。只报告本稿确实建立且可供后文使用的状态，不得概括、改写或新增状态。
+7. 以下过度改写同样 blocking：凭空出现“身为女性/女人”“我一个女人”“同为女子”“枉为女性”；以女性特有的母性、柔弱、细腻、慈悲、爱美购物偏好解释行为；把普通女性关系升级为闺蜜/暧昧/母女；替换偶像、英雄、巨人、巨兽、造物主等中性词；删除或用代词代替未映射人物姓名；把后续章节内容提前复制进本章。
+8. 外貌描写本身允许存在。只有与当前身体观察、身体互动或即时反应无关，或由外貌进一步推出温柔、母性、柔弱等人格时才判过度修改。
 
 输出结构：
 {{
@@ -5079,7 +5354,7 @@ fn build_graph_review_decision_prompt(
   "issues": [{{
     "chapter_indexes": [1],
     "scope": "chapter | cross_chapter",
-    "category": "obligation_coverage | plot | identity | ability | boundary | continuity | marker",
+    "category": "obligation_coverage | overrewrite | stereotype | neutral_term | entity_name | plot | identity | ability | boundary | continuity | marker",
     "severity": "blocking",
     "problem": "具体问题",
     "required_fix": "按义务 ID 说明必须如何修复"
@@ -9645,6 +9920,95 @@ mod tests {
     }
 
     #[test]
+    fn graph_v2_blocks_gender_labels_but_allows_contextual_appearance() {
+        let chapter = sample_chapter(1, "第一章", "白纸照了照镜子，又继续收拾行李。");
+        let settings = sample_novel_settings();
+        let appearance = ParsedChapterRewrite {
+            id: chapter.id.clone(),
+            index: chapter.index,
+            title: chapter.title.clone(),
+            text: "萧妍照了照镜子，乌黑长发垂在肩后，又继续收拾行李。".to_string(),
+        };
+        assert!(detect_graph_v2_overrewrite_issues(
+            std::slice::from_ref(&chapter),
+            std::slice::from_ref(&appearance),
+            &settings,
+        )
+        .is_empty());
+
+        let stereotyped = ParsedChapterRewrite {
+            text: "萧妍照了照镜子，心想身为女性就该更温柔些，又继续收拾行李。"
+                .to_string(),
+            ..appearance
+        };
+        let issues = detect_graph_v2_overrewrite_issues(
+            std::slice::from_ref(&chapter),
+            std::slice::from_ref(&stereotyped),
+            &settings,
+        );
+        assert!(issues.iter().any(|issue| issue.category == "stereotype"));
+    }
+
+    #[test]
+    fn graph_v2_preserves_neutral_terms_and_unmapped_character_names() {
+        let mut chapter = sample_chapter(
+            3,
+            "第三章",
+            "陈熙看着自己的偶像萧炎，忽然笑了起来。",
+        );
+        chapter.analysis_json = Some(
+            r#"{"characters":["萧炎：主角","陈熙：儿时邻居"],"names":["陈熙：女性"]}"#
+                .to_string(),
+        );
+        let rewrite = ParsedChapterRewrite {
+            id: chapter.id.clone(),
+            index: chapter.index,
+            title: chapter.title.clone(),
+            text: "她看着自己的榜样萧妍，忽然笑了起来。".to_string(),
+        };
+
+        let issues = detect_graph_v2_overrewrite_issues(
+            std::slice::from_ref(&chapter),
+            std::slice::from_ref(&rewrite),
+            &sample_novel_settings(),
+        );
+
+        assert!(issues.iter().any(|issue| issue.category == "neutral_term"));
+        assert!(issues.iter().any(|issue| {
+            issue.category == "entity_name" && issue.problem.contains("陈熙")
+        }));
+    }
+
+    #[test]
+    fn graph_v2_detects_content_copied_from_another_chapter() {
+        let repeated = "幼年虫猿仰头望向天空质问巨人为何不曾拯救自己的父母和兄长";
+        let chapters = vec![
+            sample_chapter(5, "第五章", "白纸打开包裹，把道具放到桌上。"),
+            sample_chapter(6, "第六章", &format!("{repeated}，随后接过了文明之火。")),
+        ];
+        let rewrites = vec![
+            ParsedChapterRewrite {
+                id: chapters[0].id.clone(),
+                index: 5,
+                title: chapters[0].title.clone(),
+                text: format!("白纸打开包裹。{repeated}，随后接过了文明之火。"),
+            },
+            ParsedChapterRewrite {
+                id: chapters[1].id.clone(),
+                index: 6,
+                title: chapters[1].title.clone(),
+                text: format!("{repeated}，随后接过了文明之火。"),
+            },
+        ];
+
+        let issues = detect_cross_chapter_copy_issues(&chapters, &rewrites);
+
+        assert!(issues.iter().any(|issue| {
+            issue.category == "boundary" && issue.chapter_indexes.contains(&5)
+        }));
+    }
+
+    #[test]
     fn protagonist_residue_scan_handles_multi_character_given_names() {
         let chapter = sample_chapter(12, "第十二章", "李火旺回头。小火旺别闹。旺哥今日出门。");
         let rewrite = ParsedChapterRewrite {
@@ -10510,7 +10874,8 @@ mod tests {
         );
 
         assert!(prompt.contains(contract_tail));
-        assert!(prompt.contains("逐项核对核心设定中“本次修复所需契约”"));
+        assert!(prompt.contains("按契约模式逐项核对"));
+        assert!(prompt.contains("R3_PRESERVE 必须恢复中性原意"));
     }
 
     #[test]

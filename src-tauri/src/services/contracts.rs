@@ -8,6 +8,7 @@ use crate::{
     PROTAGONIST_RULE_PACK_VERSION, REWRITE_CONTINUITY_ASSET_KIND,
 };
 use rusqlite::{params, OptionalExtension};
+use std::collections::HashSet;
 use tauri::State;
 use uuid::Uuid;
 
@@ -20,6 +21,46 @@ pub(crate) struct ContractReuseContext<'a> {
     pub(crate) profile: &'a ModelProfile,
     pub(crate) accumulated_state: &'a [RewriteStateUpdate],
     pub(crate) expected_run_id: &'a str,
+}
+
+pub(crate) fn load_compatible_continuity_json(
+    conn: &rusqlite::Connection,
+    novel_id: &str,
+) -> Result<String, String> {
+    let raw = load_canon_asset_content(conn, novel_id, REWRITE_CONTINUITY_ASSET_KIND)?
+        .unwrap_or_else(|| "[]".to_string());
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT contract_json FROM rewrite_contracts
+             WHERE novel_id = ?1 AND rule_pack_version = ?2
+               AND validation_status = 'passed'",
+        )
+        .map_err(to_string)?;
+    let contracts = stmt
+        .query_map(params![novel_id, PROTAGONIST_RULE_PACK_VERSION], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(to_string)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(to_string)?;
+    let valid_obligation_ids = contracts
+        .iter()
+        .filter_map(|contract| serde_json::from_str::<RewritePlan>(contract).ok())
+        .flat_map(|plan| {
+            plan.obligations
+                .into_iter()
+                .map(|obligation| obligation.obligation_id)
+        })
+        .collect::<HashSet<_>>();
+    let mut states = serde_json::from_str::<Vec<RewriteStateUpdate>>(&raw).unwrap_or_default();
+    states.retain(|state| {
+        !state.source_obligation_ids.is_empty()
+            && state
+                .source_obligation_ids
+                .iter()
+                .all(|id| valid_obligation_ids.contains(id))
+    });
+    serde_json::to_string(&states).map_err(to_string)
 }
 
 pub(crate) fn load_or_create_rewrite_run_id(
@@ -86,8 +127,7 @@ pub(crate) fn load_relevant_graph_context(
         .map(|content| parse_impact_graph(&content))
         .unwrap_or_default();
     let nodes = impact_nodes_for_chapters(&graph, chapters);
-    let continuity = load_canon_asset_content(&conn, novel_id, REWRITE_CONTINUITY_ASSET_KIND)?
-        .unwrap_or_else(|| "[]".to_string());
+    let continuity = load_compatible_continuity_json(&conn, novel_id)?;
     let continuity = project_relevant_continuity(&continuity, &nodes, Some(plan), &[]);
     Ok((nodes, continuity))
 }
@@ -176,9 +216,7 @@ pub(crate) fn load_reusable_rewrite_plan(
         .unwrap_or_default();
     let relevant_graph = impact_nodes_for_chapters(&graph, context.chapters);
     let relevant_graph_json = serialize_impact_graph(&relevant_graph)?;
-    let stored_continuity =
-        load_canon_asset_content(&conn, context.novel_id, REWRITE_CONTINUITY_ASSET_KIND)?
-            .unwrap_or_else(|| "[]".to_string());
+    let stored_continuity = load_compatible_continuity_json(&conn, context.novel_id)?;
     let relevant_continuity = project_relevant_continuity(
         &stored_continuity,
         &relevant_graph,
@@ -319,5 +357,78 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn continuity_ignores_states_from_older_rule_packs() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO novels (id, title, source_path, encoding, status, created_at)
+             VALUES ('novel-1', '测试', 'a.txt', 'UTF-8', 'imported', 'now')",
+            [],
+        )
+        .unwrap();
+        for index in 1..=2 {
+            conn.execute(
+                "INSERT INTO chapters (
+                    id, novel_id, chapter_index, title, original_text,
+                    analysis_status, rewrite_status
+                 ) VALUES (?1, 'novel-1', ?2, ?3, '原文', 'completed', 'completed')",
+                params![format!("chapter-{index}"), index, format!("第{index}章")],
+            )
+            .unwrap();
+        }
+        let old_contract = r#"{"plan_version":"protagonist-graph-v1","obligations":[{"obligation_id":"O-old","node_id":"N-old","chapter_index":1}]}"#;
+        let current_contract = format!(
+            r#"{{"plan_version":"{}","obligations":[{{"obligation_id":"O-current","node_id":"N-current","chapter_index":2}}]}}"#,
+            PROTAGONIST_RULE_PACK_VERSION
+        );
+        for (chapter_id, version, contract) in [
+            ("chapter-1", "protagonist-graph-v1", old_contract),
+            (
+                "chapter-2",
+                PROTAGONIST_RULE_PACK_VERSION,
+                current_contract.as_str(),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO rewrite_contracts (
+                    chapter_id, novel_id, run_id, plan_fingerprint,
+                    rule_pack_version, contract_json, coverage_json, validation_status,
+                    obligation_total, obligation_satisfied, updated_at
+                 ) VALUES (?1, 'novel-1', 'run', 'fp', ?2, ?3, '[]', 'passed', 1, 1, 'now')",
+                params![chapter_id, version, contract],
+            )
+            .unwrap();
+        }
+        let states = serde_json::json!([
+            {
+                "thread_key": "旧关系",
+                "state_type": "关系",
+                "value": "被旧规则过度改写",
+                "chapter_index": 1,
+                "source_obligation_ids": ["O-old"]
+            },
+            {
+                "thread_key": "新关系",
+                "state_type": "关系",
+                "value": "最小充分变化",
+                "chapter_index": 2,
+                "source_obligation_ids": ["O-current"]
+            }
+        ])
+        .to_string();
+        conn.execute(
+            "INSERT INTO canon_assets (novel_id, kind, content, updated_at)
+             VALUES ('novel-1', ?1, ?2, 'now')",
+            params![REWRITE_CONTINUITY_ASSET_KIND, states],
+        )
+        .unwrap();
+
+        let compatible = load_compatible_continuity_json(&conn, "novel-1").unwrap();
+
+        assert!(!compatible.contains("旧关系"));
+        assert!(compatible.contains("新关系"));
     }
 }

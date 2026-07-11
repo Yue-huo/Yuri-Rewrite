@@ -144,7 +144,7 @@ pub(crate) fn build_repair_core_prompt(
         crate::truncate_text(style_prompt.trim(), 2_000)
     };
     format!(
-        "【修复完整性要求】\n契约中的 repair_target_obligation_ids 是本轮直接修复目标；同一目标章节的其他 obligations 是必须保留的防回归约束，重写整章时不得删除或弱化。修复已列出的 blocking 问题后，必须重新逐项核对本次修复契约中的每个 required_changes 及其分号分隔的硬性子要求；发现当前稿仍缺少的动作、心理、他人反应、互动边界或连续性细节时一并补齐。不得只满足其中一项硬要求就认定整项义务完成，也不得破坏已合格内容。由“可能、可以、例如、比如、如”等词引出的内容只表示可选实现方式，不要求逐字采用或全部出现；应验收并实现其前面的深层变化目标。\n\n{}\n\n【本次修复所需契约】\n{}\n\n【相关已通过连续性状态】\n{}\n\n【低优先级全局文风补充】\n{}",
+        "【修复完整性要求】\n契约中的 repair_target_obligation_ids 是本轮直接修复目标；同一目标章节的其他 obligations 是必须保留的防回归约束，重写整章时不得删除或弱化。按节点模式修复：R3_CAUSAL_TRANSFORM / R3_DERIVED_TRANSFORM 完成最小因果变化；R3_SURFACE_ADAPT 只处理身份、称谓、身体或场景相关外貌；R3_PRESERVE 必须恢复并保留中性内容，不得添加所谓深层变化。required_changes 非空时逐项核对；为空的 R3_PRESERVE 以保留证据验收。不得引入“身为女性/女人”“同为女子”“枉为女性”、母性/柔弱/细腻等刻板表达，不得替换中性词或未映射人物姓名。适量外貌描写可以保留或补充，但必须与当前身体观察、身体互动或即时反应直接相关，且不能推出人格。由“可能、可以、例如、比如、如”等词引出的内容只表示可选实现方式，不要求逐字采用或全部出现。\n\n{}\n\n【本次修复所需契约】\n{}\n\n【相关已通过连续性状态】\n{}\n\n【低优先级全局文风补充】\n{}",
         protagonist_rule_pack(),
         format_repair_contract(plan, target_indexes.as_ref(), &failed_obligation_ids),
         prompt_context_or_none(continuity_json),

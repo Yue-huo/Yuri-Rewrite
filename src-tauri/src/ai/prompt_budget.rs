@@ -57,6 +57,7 @@ pub(crate) fn format_execution_nodes(nodes: &[SourceImpactNode]) -> String {
                 "chapter_index": node.chapter_index,
                 "presence_kind": node.presence_kind,
                 "participants": node.participants,
+                "source_evidence": node.source_evidence,
                 "narrative_function": node.narrative_function,
                 "gender_mechanisms": node.gender_mechanisms,
                 "state_before": node.state_before,
@@ -128,6 +129,7 @@ pub(crate) fn format_prior_contract_context(
                 "obligation_id": obligation.obligation_id,
                 "node_id": obligation.node_id,
                 "chapter_index": obligation.chapter_index,
+                "rule_ids": obligation.rule_ids,
                 "downstream_effects": obligation.downstream_effects,
             })
         })
@@ -312,14 +314,15 @@ mod tests {
     }
 
     #[test]
-    fn execution_nodes_omit_source_duplication() {
+    fn execution_nodes_keep_local_edit_anchor_but_omit_graph_only_fields() {
         let nodes = vec![node("关系线-A")];
         let planning = format_planning_nodes(&nodes);
         let execution = format_execution_nodes(&nodes);
 
         assert!(planning.contains("source_evidence"));
-        assert!(!execution.contains("source_evidence"));
+        assert!(execution.contains("source_evidence"));
         assert!(!execution.contains("confidence"));
+        assert!(!execution.contains("links"));
         assert!(execution.len() < planning.len());
     }
 

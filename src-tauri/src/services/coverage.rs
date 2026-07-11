@@ -3,8 +3,8 @@ use crate::domain::{
     ReviewIssue, RewritePlan, RewriteReviewDecision, RewriteStateUpdate,
 };
 use crate::{
-    load_canon_asset_content, parse_jsonish_value, parse_review_decision_output, to_string,
-    upsert_canon_asset, REWRITE_CONTINUITY_ASSET_KIND,
+    parse_jsonish_value, parse_review_decision_output, to_string, upsert_canon_asset,
+    REWRITE_CONTINUITY_ASSET_KIND,
 };
 use chrono::Utc;
 use rusqlite::params;
@@ -562,8 +562,11 @@ pub(crate) fn persist_rewrite_review_result(
         .map_err(to_string)?;
     }
     if decision.approved {
-        let existing = load_canon_asset_content(&tx, novel_id, REWRITE_CONTINUITY_ASSET_KIND)?
-            .and_then(|content| serde_json::from_str::<Vec<RewriteStateUpdate>>(&content).ok())
+        let compatible = crate::services::contracts::load_compatible_continuity_json(
+            &tx,
+            novel_id,
+        )?;
+        let existing = serde_json::from_str::<Vec<RewriteStateUpdate>>(&compatible)
             .unwrap_or_default();
         let states = merge_continuity_states(existing, state_updates);
         let content = serde_json::to_string_pretty(&states).map_err(to_string)?;

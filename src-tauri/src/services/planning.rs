@@ -6,15 +6,15 @@ use crate::{
     generate_text, impact_nodes_for_chapters, load_canon_asset_content, merge_impact_graph_nodes,
     parse_and_validate_rewrite_plan, parse_impact_graph, project_relevant_continuity,
     serialize_impact_graph, to_string, upsert_canon_asset, IMPACT_GRAPH_ASSET_KIND,
-    PROTAGONIST_RULE_PACK_VERSION, REWRITE_CONTINUITY_ASSET_KIND,
+    PROTAGONIST_RULE_PACK_VERSION,
 };
 use chrono::Utc;
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 use tauri::State;
 
-const SYSTEM_REWRITE_PLANNER: &str = "你是中文小说主角主动重构规划专家。只基于给定原文、原著影响节点、目标设定和连续性状态生成可执行契约；保留剧情事实，不写正文，只输出合法 JSON。";
-const SYSTEM_REWRITE_PLAN_REPAIR: &str = "你是改写契约 JSON 修复专家。必须修复结构、证据和一节点一义务覆盖问题，只输出完整合法 JSON，不输出解释。";
+const SYSTEM_REWRITE_PLANNER: &str = "你是中文小说最小充分性转规划专家。只基于原文证据区分因果重构、表层适配和原样保留；覆盖所有主角节点，但绝不为中性节点制造女性化变化。保留剧情事实，不写正文，只输出合法 JSON。";
+const SYSTEM_REWRITE_PLAN_REPAIR: &str = "你是改写契约 JSON 修复专家。必须修复结构、证据、一节点一义务和节点模式问题；不得把中性节点强行升级为深层重构，只输出完整合法 JSON。";
 
 pub(crate) struct RewritePlanningContext<'a> {
     pub(crate) novel_id: &'a str,
@@ -39,8 +39,10 @@ pub(crate) async fn plan_rewrite_shard(
         (
             load_canon_asset_content(&conn, context.novel_id, IMPACT_GRAPH_ASSET_KIND)?
                 .unwrap_or_else(|| "[]".to_string()),
-            load_canon_asset_content(&conn, context.novel_id, REWRITE_CONTINUITY_ASSET_KIND)?
-                .unwrap_or_else(|| "[]".to_string()),
+            crate::services::contracts::load_compatible_continuity_json(
+                &conn,
+                context.novel_id,
+            )?,
         )
     };
     let graph = parse_impact_graph(&graph_content);

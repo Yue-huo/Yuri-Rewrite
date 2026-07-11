@@ -1,5 +1,5 @@
 pub(crate) const PROTAGONIST_GRAPH_STRATEGY: &str = "protagonist_graph_v1";
-pub(crate) const PROTAGONIST_RULE_PACK_VERSION: &str = "protagonist-graph-v1";
+pub(crate) const PROTAGONIST_RULE_PACK_VERSION: &str = "protagonist-graph-v2";
 pub(crate) const LEGACY_REWRITE_STRATEGY: &str = "legacy";
 pub(crate) const REWRITE_CHECK_OFF: &str = "off";
 pub(crate) const REWRITE_CHECK_TAGGED: &str = "tagged";
@@ -16,6 +16,20 @@ pub(crate) const DEEP_DELTA_CATEGORIES: &[&str] = &[
     "humor_misunderstanding",
     "continuity_callback",
 ];
+
+pub(crate) const OBLIGATION_MODE_RULE_IDS: &[&str] = &[
+    "R3_CAUSAL_TRANSFORM",
+    "R3_SURFACE_ADAPT",
+    "R3_PRESERVE",
+    "R3_DERIVED_TRANSFORM",
+];
+
+pub(crate) fn obligation_mode_rule(rule_ids: &[String]) -> Option<&str> {
+    rule_ids
+        .iter()
+        .map(String::as_str)
+        .find(|rule| OBLIGATION_MODE_RULE_IDS.contains(rule))
+}
 
 pub(crate) fn normalize_rewrite_strategy(value: &str) -> String {
     match value.trim() {
@@ -36,15 +50,19 @@ pub(crate) fn graph_strategy_name_enabled(strategy: &str) -> bool {
 }
 
 pub(crate) fn protagonist_rule_pack() -> &'static str {
-    r#"【protagonist-graph-v1 规则包】
+    r#"【protagonist-graph-v2 规则包】
 R0_FORMAT：章节 marker、范围、顺序、标题和纯正文输出最高优先级。
 R1_PLOT_ABILITY：保留原著事件功能、因果、战力、能力、人物动机和关键结果。
 R2_IDENTITY_MAPPING：姓名映射和用户指定性转角色必须一致；未指定角色保持原身份与性别。
-R3_PROTAGONIST_NODE_DELTA：每个主角直接出现、被提及或造成后果的节点都必须出现至少一项深层变化；姓名、代词、称谓和外貌替换不能单独算完成。
-R4_MALE_INTERACTION：男性互动按女性主角身份重构社交距离、身体接触、称兄道弟、竞争、保护和旁人误会，同时保留关系功能与强度。
-R5_FEMALE_RELATION：女性关系保持原关系性质；已有感情线保留确定性，普通关系可自然重构亲近、信任、照顾和交流方式，不凭空增加恋爱对象。
-R6_SOCIAL_CAUSALITY：重构旁人反应、名声、身份判断、公开评价和原男性身份造成的叙事因果。
-R7_CONTINUITY：跨章承诺、关系边界、称谓、社会认知和衍生状态必须承接前文。
+R3_NODE_CLASSIFICATION：每个主角节点必须被覆盖，但必须且只能分类为 R3_CAUSAL_TRANSFORM、R3_SURFACE_ADAPT、R3_PRESERVE 或 R3_DERIVED_TRANSFORM；“覆盖”不等于“必须改写”。
+R3_CAUSAL_TRANSFORM：只有身体差异、明确性别称谓、恋爱/婚姻、性别化社会角色、互动边界或其他有原文证据的性别因果才做最小充分深改。
+R3_SURFACE_ADAPT：只处理姓名、代词、明确性别称谓及场景确实涉及身体/外貌时的自然适配；允许适量且符合设定的外貌描写，但不得借外貌强加性格、母性、柔弱或价值判断。
+R3_PRESERVE：性别中性节点保留原事件、措辞、心理、动作、关系与中性称谓，只执行全局身份映射；不得为了留下变化证据而新增内容。
+R3_DERIVED_TRANSFORM：只有前序已确认的性别因果确实改变本节点时才承接，必须指出依赖；不得把同线关系本身当作变化理由。
+R4_MINIMAL_CAUSALITY：使用反事实判断——若仅替换主角身份后原场景仍自然成立，就不重构该场景。禁止“女性视角”本身充当因果。
+R5_ANTI_STEREOTYPE：禁止凭空加入“身为女性/女人”“我一个女人”“同为女子”“枉为女性”、女性特有的细腻/慈悲/柔弱/母性、爱美购物偏好等刻板表达。外貌描写只能描述可观察特征，不得推出人格与行为。
+R6_ENTITY_TERM_LOCK：偶像、榜样、英雄、巨人、巨兽、强者、造物主、学生、同伴、朋友、管理员、师父、前辈、对手、敌人、主人、孩子、家伙等中性词默认保留；未列入姓名映射的人物姓名不得删除、改名或用代词替代。
+R7_RELATION_CONTINUITY：关系性质、强度、称谓、承诺和互动边界只承接有证据的变化；普通女性关系不得自动升级为闺蜜、暧昧、依赖或母女关系。
 R8_STYLE：风格补充只影响语言、节奏和表现方式，不得覆盖以上规则。
 R9_CLEANUP：只保守清理广告、乱码、更新提示和无关噪音，不删除剧情、番外、后记或专有信息。
 
@@ -69,9 +87,11 @@ mod tests {
     }
 
     #[test]
-    fn rule_pack_requires_deep_protagonist_changes() {
+    fn rule_pack_requires_classification_and_minimal_causality() {
         let pack = protagonist_rule_pack();
-        assert!(pack.contains("R3_PROTAGONIST_NODE_DELTA"));
-        assert!(pack.contains("姓名、代词、称谓和外貌替换不能单独算完成"));
+        assert!(pack.contains("R3_NODE_CLASSIFICATION"));
+        assert!(pack.contains("覆盖”不等于“必须改写"));
+        assert!(pack.contains("允许适量且符合设定的外貌描写"));
+        assert!(pack.contains("偶像、榜样、英雄、巨人、巨兽"));
     }
 }

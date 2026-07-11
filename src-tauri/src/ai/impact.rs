@@ -3,7 +3,8 @@ use crate::domain::{
 };
 use crate::{
     format_planning_nodes, format_prior_contract_context, parse_jsonish_value,
-    protagonist_rule_pack, DEEP_DELTA_CATEGORIES,
+    obligation_mode_rule, protagonist_rule_pack, DEEP_DELTA_CATEGORIES,
+    OBLIGATION_MODE_RULE_IDS, PROTAGONIST_RULE_PACK_VERSION,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -303,9 +304,9 @@ pub(crate) fn build_rewrite_plan_prompt(
 
 硬性规划规则：
 1. 当前分片中每个主角影响节点必须恰好对应一个 obligation；不能遗漏、合并或重复 node_id。
-2. 每个 obligation 必须包含 R3_PROTAGONIST_NODE_DELTA，并至少选择一个深层变化类别。
-3. 姓名、代词、称谓和外貌变化可以伴随出现，但不能单独作为 required_changes。
-4. 即使节点不明显依赖性别，也要在不改变事件功能的前提下规划一个具体微变化，例如视角、动作表达、他人反应、交流方式或连续性呼应。
+2. 每个 obligation 的 rule_ids 必须且只能包含一个节点模式：R3_CAUSAL_TRANSFORM、R3_SURFACE_ADAPT、R3_PRESERVE 或 R3_DERIVED_TRANSFORM。先分类，再决定是否修改；绝不能为了证明“改过”而制造变化。
+3. 使用反事实检验：若只替换主角姓名、代词和必要称谓后，原场景的事件、心理、动作、互动、评价与关系仍自然成立，就必须选择 R3_PRESERVE；该模式 required_changes 和 deep_delta_categories 均为空，并在 preserve 中写明原样保留的中性内容。
+4. 只有身体差异、明确性别称谓、恋爱/婚姻、性别化社会角色、身体接触边界或其他有原文证据的性别因果，才选择 R3_CAUSAL_TRANSFORM 并规划最小充分变化。仅需姓名、代词、明确性别称谓或场景相关外貌适配时选择 R3_SURFACE_ADAPT，deep_delta_categories 留空。只有前序已确认变化确实传导到本节点时选择 R3_DERIVED_TRANSFORM，并逐字列出依赖标识。
 5. 保留原著事件、结果、能力、人物动机和关系性质；不得凭空增加恋爱对象、重大事件或剧情分支。
 6. 复核原文是否漏掉主角直接出现、被提及或造成后果的节点；遗漏节点放入 graph_additions，并立即为其创建 obligation。graph_additions.node_id 使用 `new-章节index-序号`，对应 obligation.node_id 必须相同。
 7. source_evidence 必须逐字摘自原文，不得概括或改写。
@@ -314,20 +315,24 @@ pub(crate) fn build_rewrite_plan_prompt(
 10. 每个 planned_state_updates 项必须包含 thread_key、state_type、value、当前分片 chapter_index 和非空 source_obligation_ids；义务内部的状态必须把该义务自身 ID 列为来源。
 11. required_changes 只写最终必须验收的可见结果，使用简短独立数组项；不要把“可能、可以、例如、比如、如……”等可选实现示例混入硬要求。需要某个具体动作或反应时直接写成必须发生的结果。
 12. 原著影响图的 thread_key 为保持稳定可以含原主角姓名，但 planned_state_updates.value 必须使用目标改写名或“主角”，不得把原名、原名别名写进将传给后文的连续性状态。
+13. 禁止把“女性视角”“女性特有”“同为女子”“身为女性/女人”“我一个女人”“枉为女性”、母性、柔弱、细腻、爱美或购物偏好当作变化理由。普通女性关系不得自动改成闺蜜、暧昧、依赖或母女关系。
+14. 偶像、榜样、英雄、巨人、巨兽、强者、造物主、学生、同伴、朋友、管理员、师父、前辈、对手、敌人、主人、孩子、家伙等是中性词；不得仅因主角性转而替换。未列入姓名映射的人物姓名必须逐字保留，不得改成代词。
+15. 外貌描写可以适量添加，但只限原场景正在观察身体/外貌、发生身体互动或该特征影响当下反应时；必须符合用户身材设定，只描述可观察特征，不得推出温柔、母性、柔弱、慈悲等人格。
+16. 旧影响图中的 gender_mechanisms 只是待复核候选，不是改写命令。若其理由只是“原男性身份在场/观察/记录/决定/使用能力/担任造物主”等，必须判为中性并选择 R3_PRESERVE；不得沿用“可受女性视角影响”之类无原文依据的旧结论。
 
 允许的深层变化类别：{}
 
 只输出此结构：
 {{
-  "plan_version": "protagonist-graph-v1",
+  "plan_version": "protagonist-graph-v2",
   "graph_additions": [],
   "obligations": [{{
     "obligation_id": "O-节点ID",
     "node_id": "节点ID",
     "chapter_index": 1,
-    "rule_ids": ["R3_PROTAGONIST_NODE_DELTA", "R6_SOCIAL_CAUSALITY"],
+    "rule_ids": ["R3_CAUSAL_TRANSFORM", "R4_MINIMAL_CAUSALITY"],
     "preserve": ["必须保留的剧情功能"],
-    "required_changes": ["必须在正文中可见的深层变化"],
+    "required_changes": ["反事实检验确认必要的最小变化；R3_PRESERVE 时为空数组"],
     "deep_delta_categories": ["other_reaction"],
     "forbidden_regressions": ["不能引入的退化"],
     "downstream_effects": ["后续必须承接的影响"],
@@ -409,8 +414,10 @@ pub(crate) fn parse_and_validate_rewrite_plan(
     normalize_cross_shard_dependencies(&mut value)?;
     let mut plan: RewritePlan = serde_json::from_value(value)
         .map_err(|error| format!("改写契约 JSON 字段无效：{error}"))?;
-    if plan.plan_version.trim() != "protagonist-graph-v1" {
-        return Err("改写契约 plan_version 必须是 protagonist-graph-v1。".to_string());
+    if plan.plan_version.trim() != PROTAGONIST_RULE_PACK_VERSION {
+        return Err(format!(
+            "改写契约 plan_version 必须是 {PROTAGONIST_RULE_PACK_VERSION}。"
+        ));
     }
     let original_addition_ids = plan
         .graph_additions
@@ -562,6 +569,23 @@ fn validate_plan_state_updates(plan: &RewritePlan, chapters: &[Chapter]) -> Resu
         {
             return Err("计划状态必须包含 thread_key、state_type 和 value。".to_string());
         }
+        if [
+            "身为女性",
+            "身为女人",
+            "我一个女人",
+            "同为女子",
+            "枉为女性",
+            "女性特有",
+            "母性本能",
+        ]
+        .iter()
+        .any(|term| state.value.contains(term))
+        {
+            return Err(format!(
+                "计划状态 {} / {} 含无原文依据的性别刻板表达。",
+                state.thread_key, state.state_type
+            ));
+        }
         if !chapter_indexes.contains(&state.chapter_index) {
             return Err(format!(
                 "计划状态 {} / {} 引用了当前分片之外的章节 {}。",
@@ -606,36 +630,129 @@ fn validate_obligation(obligation: &RewriteObligation) -> Result<(), String> {
     if obligation.obligation_id.trim().is_empty() {
         return Err("改写义务缺少 obligation_id。".to_string());
     }
-    if !obligation
+    let mode_count = obligation
         .rule_ids
         .iter()
-        .any(|rule| rule == "R3_PROTAGONIST_NODE_DELTA")
-    {
+        .filter(|rule| OBLIGATION_MODE_RULE_IDS.contains(&rule.as_str()))
+        .count();
+    if mode_count != 1 {
         return Err(format!(
-            "义务 {} 缺少 R3_PROTAGONIST_NODE_DELTA。",
+            "义务 {} 必须且只能包含一个 R3 节点模式。",
             obligation.obligation_id
         ));
     }
-    if obligation.required_changes.is_empty() {
+    let mode = obligation_mode_rule(&obligation.rule_ids).expect("validated one mode");
+    let has_invalid_category = obligation
+        .deep_delta_categories
+        .iter()
+        .any(|category| !DEEP_DELTA_CATEGORIES.contains(&category.as_str()));
+    if has_invalid_category {
         return Err(format!(
-            "义务 {} 没有 required_changes。",
+            "义务 {} 包含未知的深层变化类别。",
             obligation.obligation_id
         ));
     }
-    if obligation.deep_delta_categories.is_empty()
-        || obligation
-            .deep_delta_categories
-            .iter()
-            .any(|category| !DEEP_DELTA_CATEGORIES.contains(&category.as_str()))
-    {
-        return Err(format!(
-            "义务 {} 缺少合法的深层变化类别。",
-            obligation.obligation_id
-        ));
+    match mode {
+        "R3_PRESERVE" => {
+            if obligation.preserve.is_empty()
+                || !obligation.required_changes.is_empty()
+                || !obligation.deep_delta_categories.is_empty()
+            {
+                return Err(format!(
+                    "义务 {} 的 R3_PRESERVE 必须有 preserve，且 required_changes/deep_delta_categories 为空。",
+                    obligation.obligation_id
+                ));
+            }
+        }
+        "R3_SURFACE_ADAPT" => {
+            if obligation.required_changes.is_empty()
+                || !obligation.deep_delta_categories.is_empty()
+            {
+                return Err(format!(
+                    "义务 {} 的 R3_SURFACE_ADAPT 必须有表层适配要求且不能伪造深层类别。",
+                    obligation.obligation_id
+                ));
+            }
+        }
+        "R3_CAUSAL_TRANSFORM" | "R3_DERIVED_TRANSFORM" => {
+            if obligation.required_changes.is_empty()
+                || obligation.deep_delta_categories.is_empty()
+            {
+                return Err(format!(
+                    "义务 {} 的因果重构缺少 required_changes 或深层变化类别。",
+                    obligation.obligation_id
+                ));
+            }
+            if mode == "R3_DERIVED_TRANSFORM" && obligation.downstream_effects.is_empty() {
+                return Err(format!(
+                    "义务 {} 的 R3_DERIVED_TRANSFORM 缺少明确依赖或传导说明。",
+                    obligation.obligation_id
+                ));
+            }
+        }
+        _ => unreachable!(),
     }
-    let surface_terms = [
-        "改名", "姓名", "代词", "称谓", "外貌", "发丝", "衣裙", "身材",
+    let forbidden_stereotypes = [
+        "身为女性",
+        "身为女人",
+        "我一个女人",
+        "一个女人怎么",
+        "同为女子",
+        "枉为女性",
+        "女性特有",
+        "女性化的细腻",
+        "女孩子半条命",
+        "清秀的字迹",
+        "购物偏好",
+        "母性",
     ];
+    let contract_text = obligation
+        .preserve
+        .iter()
+        .chain(obligation.required_changes.iter())
+        .chain(obligation.downstream_effects.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if let Some(term) = forbidden_stereotypes
+        .iter()
+        .find(|term| contract_text.contains(**term))
+    {
+        return Err(format!(
+            "义务 {} 使用了无原文依据的性别刻板表达：{}。",
+            obligation.obligation_id, term
+        ));
+    }
+    let neutral_terms = [
+        "偶像", "榜样", "英雄", "巨人", "巨兽", "强者", "造物主", "学生", "同伴",
+        "朋友", "管理员", "师父", "前辈", "对手", "敌人", "主人", "孩子", "家伙",
+    ];
+    if let Some(change) = obligation.required_changes.iter().find(|change| {
+        neutral_terms.iter().any(|term| {
+            [
+                format!("将{term}改"),
+                format!("将“{term}”改"),
+                format!("把{term}改"),
+                format!("把“{term}”改"),
+                format!("不再使用{term}"),
+                format!("不再使用“{term}”"),
+                format!("替换{term}"),
+                format!("替换“{term}”"),
+            ]
+            .iter()
+            .any(|pattern| change.contains(pattern))
+        })
+    }) {
+        return Err(format!(
+            "义务 {} 试图因性转替换中性词：{}。",
+            obligation.obligation_id, change
+        ));
+    }
+
+    if !matches!(mode, "R3_CAUSAL_TRANSFORM" | "R3_DERIVED_TRANSFORM") {
+        return Ok(());
+    }
+    let surface_terms = ["改名", "姓名", "代词", "称谓", "外貌", "发丝", "衣裙", "身材"];
     let deep_terms = [
         "自我认知",
         "自我感知",
@@ -674,7 +791,6 @@ fn validate_obligation(obligation: &RewriteObligation) -> Result<(), String> {
         "距离",
         "交流方式",
         "社交",
-        "女性视角",
         "书写风格",
         "内心独白",
         "视角",
@@ -1203,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_requires_exactly_one_deep_obligation_per_node() {
+    fn plan_requires_exactly_one_mode_and_allows_preserved_neutral_nodes() {
         let chapter = chapter();
         let nodes = parse_impact_nodes_from_analysis(
             r#"{"protagonist_impact_nodes":[{"chapter_index":1,"presence_kind":"direct","source_evidence":"萧炎推门进来","narrative_function":"入场"}]}"#,
@@ -1211,43 +1327,73 @@ mod tests {
         )
         .unwrap();
         let valid = format!(
-            r#"{{"plan_version":"protagonist-graph-v1","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_PROTAGONIST_NODE_DELTA"],"required_changes":["让药老对她的入场方式产生可见反应"],"deep_delta_categories":["other_reaction"]}}]}}"#,
+            r#"{{"plan_version":"protagonist-graph-v2","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_PRESERVE"],"preserve":["保留中性的推门入场和药老原反应"],"required_changes":[],"deep_delta_categories":[]}}]}}"#,
             nodes[0].node_id
         );
         assert!(
             parse_and_validate_rewrite_plan(&valid, std::slice::from_ref(&chapter), &nodes).is_ok()
         );
 
-        let surface_only =
-            valid.replace("让药老对她的入场方式产生可见反应", "只修改姓名、代词和外貌");
+        let surface_only = valid
+            .replace("R3_PRESERVE", "R3_SURFACE_ADAPT")
+            .replace(r#""required_changes":[]"#, r#""required_changes":["把叔叔改为阿姨并自然适配外貌"]"#)
+            .replace(r#""preserve":["保留中性的推门入场和药老原反应"],"#, "");
         assert!(parse_and_validate_rewrite_plan(
             &surface_only,
             std::slice::from_ref(&chapter),
             &nodes,
         )
-        .is_err());
+        .is_ok());
 
-        let surface_and_deep = valid.replace(
-            "让药老对她的入场方式产生可见反应",
-            "将男性代词替换为女性代词；增加继承母皇身份时的微妙共鸣和自我感知变化",
+        let surface_and_deep = surface_only.replace(
+            r#""deep_delta_categories":[]"#,
+            r#""deep_delta_categories":["other_reaction"]"#,
         );
         assert!(parse_and_validate_rewrite_plan(
             &surface_and_deep,
             std::slice::from_ref(&chapter),
             &nodes,
         )
-        .is_ok());
+        .is_err());
 
-        let separate_surface_and_deep = valid.replace(
-            r#""required_changes":["让药老对她的入场方式产生可见反应"]"#,
-            r#""required_changes":["将男性代词替换为女性代词","增加继承母皇身份时的微妙共鸣"]"#,
-        );
+        let separate_surface_and_deep = surface_only
+            .replace("R3_SURFACE_ADAPT", "R3_CAUSAL_TRANSFORM")
+            .replace(
+                r#""required_changes":["把叔叔改为阿姨并自然适配外貌"]"#,
+                r#""required_changes":["让原文明确的身体接触边界发生最小变化"]"#,
+            )
+            .replace(
+                r#""deep_delta_categories":[]"#,
+                r#""deep_delta_categories":["interaction_boundary"]"#,
+            );
         assert!(parse_and_validate_rewrite_plan(
             &separate_surface_and_deep,
             std::slice::from_ref(&chapter),
             &nodes,
         )
         .is_ok());
+
+        let stereotyped = separate_surface_and_deep.replace(
+            "让原文明确的身体接触边界发生最小变化",
+            "身为女性，她对这段互动产生母性本能",
+        );
+        assert!(parse_and_validate_rewrite_plan(
+            &stereotyped,
+            std::slice::from_ref(&chapter),
+            &nodes,
+        )
+        .is_err());
+
+        let neutral_replacement = surface_only.replace(
+            "把叔叔改为阿姨并自然适配外貌",
+            "不再使用“偶像”，改为“榜样”",
+        );
+        assert!(parse_and_validate_rewrite_plan(
+            &neutral_replacement,
+            std::slice::from_ref(&chapter),
+            &nodes,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1259,7 +1405,7 @@ mod tests {
         )
         .unwrap();
         let output = format!(
-            r#"{{"plan_version":"protagonist-graph-v1","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_PROTAGONIST_NODE_DELTA"],"required_changes":["让药老对她的入场方式产生可见反应"],"deep_delta_categories":["other_reaction"]}}],"cross_shard_dependencies":[{{"obligation_id":"O-prior","reason":"承接前序状态"}}]}}"#,
+            r#"{{"plan_version":"protagonist-graph-v2","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_CAUSAL_TRANSFORM"],"required_changes":["让药老对她的入场方式产生有原文依据的反应"],"deep_delta_categories":["other_reaction"]}}],"cross_shard_dependencies":[{{"obligation_id":"O-prior","reason":"承接前序状态"}}]}}"#,
             nodes[0].node_id
         );
 
@@ -1274,7 +1420,7 @@ mod tests {
 
     #[test]
     fn planner_rejects_dependency_objects_without_a_stable_identifier() {
-        let output = r#"{"plan_version":"protagonist-graph-v1","cross_shard_dependencies":[{"reason":"承接前序状态"}]}"#;
+        let output = r#"{"plan_version":"protagonist-graph-v2","cross_shard_dependencies":[{"reason":"承接前序状态"}]}"#;
         let error = parse_and_validate_rewrite_plan(output, &[], &[]).unwrap_err();
         assert!(error.contains("缺少 obligation_id、node_id 或 thread_key"));
     }
@@ -1283,7 +1429,7 @@ mod tests {
     fn planner_addition_gets_stable_ids_and_remaps_state_provenance() {
         let chapter = chapter();
         let output = r#"{
-          "plan_version":"protagonist-graph-v1",
+          "plan_version":"protagonist-graph-v2",
           "graph_additions":[{
             "node_id":"new-1-1",
             "chapter_index":1,
@@ -1296,7 +1442,7 @@ mod tests {
             "obligation_id":"O-new-1-1",
             "node_id":"new-1-1",
             "chapter_index":1,
-            "rule_ids":["R3_PROTAGONIST_NODE_DELTA"],
+            "rule_ids":["R3_CAUSAL_TRANSFORM"],
             "required_changes":["让药老的观察反应产生可见差异"],
             "deep_delta_categories":["other_reaction"],
             "planned_state_updates":[{
@@ -1430,31 +1576,46 @@ mod tests {
         let obligations = nodes
             .iter()
             .enumerate()
-            .map(|(index, node)| RewriteObligation {
-                obligation_id: format!("O-{index}"),
-                node_id: node.node_id.clone(),
-                chapter_index: 1,
-                rule_ids: vec!["R3_PROTAGONIST_NODE_DELTA".to_string()],
-                preserve: vec![node.narrative_function.clone()],
-                required_changes: vec![changes[index].to_string()],
-                deep_delta_categories: vec![categories[index].to_string()],
-                forbidden_regressions: Vec::new(),
-                downstream_effects: Vec::new(),
-                planned_state_updates: if index == 6 {
-                    vec![RewriteStateUpdate {
-                        thread_key: "主角-薰儿承诺".to_string(),
-                        state_type: "承诺".to_string(),
-                        value: "不再隐瞒".to_string(),
-                        chapter_index: 1,
-                        source_obligation_ids: vec!["O-6".to_string()],
-                    }]
-                } else {
-                    Vec::new()
-                },
+            .map(|(index, node)| {
+                let mode = match index {
+                    2 | 5 | 6 => "R3_PRESERVE",
+                    3 => "R3_SURFACE_ADAPT",
+                    _ => "R3_CAUSAL_TRANSFORM",
+                };
+                RewriteObligation {
+                    obligation_id: format!("O-{index}"),
+                    node_id: node.node_id.clone(),
+                    chapter_index: 1,
+                    rule_ids: vec![mode.to_string()],
+                    preserve: vec![node.narrative_function.clone()],
+                    required_changes: if mode == "R3_PRESERVE" {
+                        Vec::new()
+                    } else {
+                        vec![changes[index].to_string()]
+                    },
+                    deep_delta_categories: if mode == "R3_CAUSAL_TRANSFORM" {
+                        vec![categories[index].to_string()]
+                    } else {
+                        Vec::new()
+                    },
+                    forbidden_regressions: Vec::new(),
+                    downstream_effects: Vec::new(),
+                    planned_state_updates: if index == 6 {
+                        vec![RewriteStateUpdate {
+                            thread_key: "主角-薰儿承诺".to_string(),
+                            state_type: "承诺".to_string(),
+                            value: "不再隐瞒".to_string(),
+                            chapter_index: 1,
+                            source_obligation_ids: vec!["O-6".to_string()],
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                }
             })
             .collect::<Vec<_>>();
         let plan = RewritePlan {
-            plan_version: "protagonist-graph-v1".to_string(),
+            plan_version: "protagonist-graph-v2".to_string(),
             graph_additions: Vec::new(),
             obligations,
             planned_state_updates: Vec::new(),
