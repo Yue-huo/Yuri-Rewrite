@@ -631,13 +631,28 @@ fn validate_obligation(obligation: &RewriteObligation) -> Result<(), String> {
             obligation.obligation_id
         ));
     }
-    let joined = obligation.required_changes.join("");
     let surface_terms = [
         "改名", "姓名", "代词", "称谓", "外貌", "发丝", "衣裙", "身材",
     ];
     let deep_terms = [
         "自我认知",
+        "自我感知",
+        "自我投射",
         "心理",
+        "内心",
+        "感知",
+        "感受",
+        "共鸣",
+        "认同",
+        "亲切感",
+        "情绪",
+        "心态",
+        "期待",
+        "敏感",
+        "关怀",
+        "同情",
+        "保护欲",
+        "轻视",
         "反应",
         "互动",
         "边界",
@@ -656,12 +671,27 @@ fn validate_obligation(obligation: &RewriteObligation) -> Result<(), String> {
         "承诺",
         "距离",
         "交流方式",
+        "社交",
+        "女性视角",
+        "书写风格",
+        "内心独白",
         "视角",
         "保护方式",
         "处境",
     ];
-    if surface_terms.iter().any(|term| joined.contains(term))
-        && !deep_terms.iter().any(|term| joined.contains(term))
+    let has_surface_change = obligation
+        .required_changes
+        .iter()
+        .any(|change| surface_terms.iter().any(|term| change.contains(term)));
+    let has_standalone_non_surface_change = obligation
+        .required_changes
+        .iter()
+        .any(|change| !surface_terms.iter().any(|term| change.contains(term)));
+    let has_explicit_deep_signal = obligation
+        .required_changes
+        .iter()
+        .any(|change| deep_terms.iter().any(|term| change.contains(term)));
+    if has_surface_change && !has_standalone_non_surface_change && !has_explicit_deep_signal
     {
         return Err(format!(
             "义务 {} 只描述了表层姓名或外貌修改。",
@@ -1194,6 +1224,28 @@ mod tests {
             &nodes,
         )
         .is_err());
+
+        let surface_and_deep = valid.replace(
+            "让药老对她的入场方式产生可见反应",
+            "将男性代词替换为女性代词；增加继承母皇身份时的微妙共鸣和自我感知变化",
+        );
+        assert!(parse_and_validate_rewrite_plan(
+            &surface_and_deep,
+            std::slice::from_ref(&chapter),
+            &nodes,
+        )
+        .is_ok());
+
+        let separate_surface_and_deep = valid.replace(
+            r#""required_changes":["让药老对她的入场方式产生可见反应"]"#,
+            r#""required_changes":["将男性代词替换为女性代词","增加继承母皇身份时的微妙共鸣"]"#,
+        );
+        assert!(parse_and_validate_rewrite_plan(
+            &separate_surface_and_deep,
+            std::slice::from_ref(&chapter),
+            &nodes,
+        )
+        .is_ok());
     }
 
     #[test]
