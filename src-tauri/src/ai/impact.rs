@@ -310,7 +310,7 @@ pub(crate) fn build_rewrite_plan_prompt(
 6. 复核原文是否漏掉主角直接出现、被提及或造成后果的节点；遗漏节点放入 graph_additions，并立即为其创建 obligation。graph_additions.node_id 使用 `new-章节index-序号`，对应 obligation.node_id 必须相同。
 7. source_evidence 必须逐字摘自原文，不得概括或改写。
 8. 如果提供“当前改写稿”，比较其与原文：已经满足深层变化的节点仍保留一项验收义务，并在 preserve 中写明保持现有处理；未满足节点和本次新要求进入修复义务，避免破坏已经成立的改写。
-9. 阅读前序分片契约。如果当前义务依赖前序 node_id、obligation_id、thread_key 或计划状态，把稳定标识写入 cross_shard_dependencies；无依赖时返回空数组。
+9. 阅读前序分片契约。如果当前义务依赖前序 node_id、obligation_id、thread_key 或计划状态，把稳定标识写入 cross_shard_dependencies。该字段必须是扁平字符串数组（例如 ["obligation:O-xxx", "thread:师徒"]），严禁输出对象；无依赖时返回空数组。
 10. 每个 planned_state_updates 项必须包含 thread_key、state_type、value、当前分片 chapter_index 和非空 source_obligation_ids；义务内部的状态必须把该义务自身 ID 列为来源。
 
 允许的深层变化类别：{}
@@ -403,7 +403,8 @@ pub(crate) fn parse_and_validate_rewrite_plan(
     chapters: &[Chapter],
     base_nodes: &[SourceImpactNode],
 ) -> Result<RewritePlan, String> {
-    let value = parse_jsonish_value(output)?;
+    let mut value = parse_jsonish_value(output)?;
+    normalize_cross_shard_dependencies(&mut value)?;
     let mut plan: RewritePlan = serde_json::from_value(value)
         .map_err(|error| format!("改写契约 JSON 字段无效：{error}"))?;
     if plan.plan_version.trim() != "protagonist-graph-v1" {
@@ -486,6 +487,50 @@ pub(crate) fn parse_and_validate_rewrite_plan(
     }
     validate_plan_state_updates(&plan, chapters)?;
     Ok(plan)
+}
+
+fn normalize_cross_shard_dependencies(value: &mut serde_json::Value) -> Result<(), String> {
+    let Some(dependencies) = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("cross_shard_dependencies"))
+    else {
+        return Ok(());
+    };
+    let Some(items) = dependencies.as_array_mut() else {
+        return Err("cross_shard_dependencies 必须是字符串数组。".to_string());
+    };
+
+    for item in items {
+        if item.is_string() {
+            continue;
+        }
+        let object = item
+            .as_object()
+            .ok_or_else(|| "cross_shard_dependencies 只能包含稳定 ID 字符串。".to_string())?;
+        let dependency = [
+            ("obligation_id", "obligation:"),
+            ("node_id", "node:"),
+            ("thread_key", "thread:"),
+            ("dependency_id", ""),
+            ("depends_on", ""),
+            ("id", ""),
+        ]
+        .iter()
+        .find_map(|(key, prefix)| {
+            object
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("{prefix}{value}"))
+        })
+        .ok_or_else(|| {
+            "cross_shard_dependencies 对象缺少 obligation_id、node_id 或 thread_key 稳定标识。"
+                .to_string()
+        })?;
+        *item = serde_json::Value::String(dependency);
+    }
+    Ok(())
 }
 
 fn validate_plan_state_updates(plan: &RewritePlan, chapters: &[Chapter]) -> Result<(), String> {
@@ -1149,6 +1194,35 @@ mod tests {
             &nodes,
         )
         .is_err());
+    }
+
+    #[test]
+    fn planner_normalizes_object_dependencies_without_another_model_call() {
+        let chapter = chapter();
+        let nodes = parse_impact_nodes_from_analysis(
+            r#"{"protagonist_impact_nodes":[{"chapter_index":1,"presence_kind":"direct","source_evidence":"萧炎推门进来","narrative_function":"入场"}]}"#,
+            std::slice::from_ref(&chapter),
+        )
+        .unwrap();
+        let output = format!(
+            r#"{{"plan_version":"protagonist-graph-v1","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_PROTAGONIST_NODE_DELTA"],"required_changes":["让药老对她的入场方式产生可见反应"],"deep_delta_categories":["other_reaction"]}}],"cross_shard_dependencies":[{{"obligation_id":"O-prior","reason":"承接前序状态"}}]}}"#,
+            nodes[0].node_id
+        );
+
+        let plan = parse_and_validate_rewrite_plan(&output, std::slice::from_ref(&chapter), &nodes)
+            .unwrap();
+
+        assert_eq!(
+            plan.cross_shard_dependencies,
+            vec!["obligation:O-prior".to_string()]
+        );
+    }
+
+    #[test]
+    fn planner_rejects_dependency_objects_without_a_stable_identifier() {
+        let output = r#"{"plan_version":"protagonist-graph-v1","cross_shard_dependencies":[{"reason":"承接前序状态"}]}"#;
+        let error = parse_and_validate_rewrite_plan(output, &[], &[]).unwrap_err();
+        assert!(error.contains("缺少 obligation_id、node_id 或 thread_key"));
     }
 
     #[test]

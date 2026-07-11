@@ -34,6 +34,9 @@ pub(crate) async fn plan_rewrite_shard(
     state: &State<'_, AppState>,
     context: RewritePlanningContext<'_>,
 ) -> Result<RewritePlan, String> {
+    // Structured contracts need deterministic JSON, not a reasoning transcript. In particular,
+    // reasoning-first models can otherwise spend the whole completion budget before writing content.
+    let planning_profile = structured_planning_profile(context.profile);
     let (graph_content, continuity_json) = {
         let conn = state.conn.lock().map_err(to_string)?;
         (
@@ -63,7 +66,7 @@ pub(crate) async fn plan_rewrite_shard(
     let output = generate_text(
         &state.client,
         Some(state.rate_limits.clone()),
-        context.profile,
+        &planning_profile,
         context.api_key,
         SYSTEM_REWRITE_PLANNER,
         &prompt,
@@ -77,7 +80,7 @@ pub(crate) async fn plan_rewrite_shard(
         "分片改写规划",
         Some(context.shard_label),
         "success",
-        &format_model_log_content(&output, context.profile, Some(true)),
+        &format_model_log_content(&output, &planning_profile, Some(true)),
         output.reasoning.as_deref(),
         Some(&output.raw_response),
     )?;
@@ -103,7 +106,7 @@ pub(crate) async fn plan_rewrite_shard(
             let repaired = generate_text(
                 &state.client,
                 Some(state.rate_limits.clone()),
-                context.profile,
+                &planning_profile,
                 context.api_key,
                 SYSTEM_REWRITE_PLAN_REPAIR,
                 &repair_prompt,
@@ -117,7 +120,7 @@ pub(crate) async fn plan_rewrite_shard(
                 "分片改写规划修复",
                 Some(context.shard_label),
                 "success",
-                &format_model_log_content(&repaired, context.profile, Some(true)),
+                &format_model_log_content(&repaired, &planning_profile, Some(true)),
                 repaired.reasoning.as_deref(),
                 Some(&repaired.raw_response),
             )?;
@@ -140,6 +143,12 @@ pub(crate) async fn plan_rewrite_shard(
         context.batch_index,
     )?;
     Ok(plan)
+}
+
+fn structured_planning_profile(profile: &ModelProfile) -> ModelProfile {
+    let mut profile = profile.clone();
+    profile.thinking_mode = "off".to_string();
+    profile
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -316,6 +325,19 @@ mod tests {
             api_key_storage: "none".to_string(),
             updated_at: "now".to_string(),
         }
+    }
+
+    #[test]
+    fn structured_planning_disables_thinking_without_mutating_saved_profile() {
+        let mut saved = profile();
+        saved.thinking_mode = "auto".to_string();
+
+        let effective = structured_planning_profile(&saved);
+
+        assert_eq!(effective.thinking_mode, "off");
+        assert_eq!(effective.id, saved.id);
+        assert_eq!(effective.model, saved.model);
+        assert_eq!(saved.thinking_mode, "auto");
     }
 
     #[test]
