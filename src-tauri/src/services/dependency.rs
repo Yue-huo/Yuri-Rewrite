@@ -110,6 +110,23 @@ pub(crate) fn build_dependency_levels(
             if dependency.is_empty() {
                 return Err(format!("分片 {} 包含空的跨分片依赖。", shard_index + 1));
             }
+            let references_own_node_or_obligation = node_owner
+                .get(dependency)
+                .or_else(|| obligation_owner.get(dependency))
+                .is_some_and(|owner| *owner == shard_index);
+            let references_current_thread_without_a_prior_owner = thread_owners
+                .get(dependency)
+                .is_some_and(|owners| {
+                    owners.contains(&shard_index)
+                        && owners.range(..shard_index).next_back().is_none()
+                });
+            if references_own_node_or_obligation || references_current_thread_without_a_prior_owner
+            {
+                // Models occasionally repeat an ID or thread created by the current shard in the
+                // cross-shard field. It carries no scheduling information and must not make an
+                // otherwise valid plan fail as an unresolvable dependency.
+                continue;
+            }
             let owner = node_owner
                 .get(dependency)
                 .or_else(|| obligation_owner.get(dependency))
@@ -250,6 +267,16 @@ mod tests {
             build_dependency_levels(&plans, &graph).unwrap(),
             vec![0, 1, 1]
         );
+    }
+
+    #[test]
+    fn current_shard_ids_and_threads_are_ignored_as_non_cross_dependencies() {
+        let plans = vec![
+            plan(0, &[], ""),
+            plan(1, &["O-1", "thread:当前关系线"], "当前关系线"),
+        ];
+
+        assert_eq!(build_dependency_levels(&plans, &[]).unwrap(), vec![0, 0]);
     }
 
     #[test]
