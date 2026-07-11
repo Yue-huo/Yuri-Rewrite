@@ -16,11 +16,58 @@ pub(crate) fn evidence_exists_in_rewrite(
     rewrites: &[ParsedChapterRewrite],
 ) -> bool {
     let evidence = item.evidence.trim();
-    !evidence.is_empty()
-        && rewrites.iter().any(|rewrite| {
-            (item.chapter_indexes.is_empty() || item.chapter_indexes.contains(&rewrite.index))
-                && (rewrite.title.contains(evidence) || rewrite.text.contains(evidence))
-        })
+    if evidence.is_empty() {
+        return false;
+    }
+    rewrites.iter().any(|rewrite| {
+        if !item.chapter_indexes.is_empty() && !item.chapter_indexes.contains(&rewrite.index) {
+            return false;
+        }
+        let rewrite_text = format!("{}\n{}", rewrite.title, rewrite.text);
+        let normalized_rewrite = normalize_coverage_evidence(&rewrite_text);
+        let normalized_evidence = normalize_coverage_evidence(evidence);
+        if !normalized_evidence.is_empty() && normalized_rewrite.contains(&normalized_evidence) {
+            return true;
+        }
+
+        let fragments = split_coverage_evidence(evidence);
+        fragments.len() > 1
+            && fragments
+                .iter()
+                .all(|fragment| normalized_rewrite.contains(fragment))
+    })
+}
+
+fn normalize_coverage_evidence(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn split_coverage_evidence(evidence: &str) -> Vec<String> {
+    let mut fragments = Vec::new();
+    let mut current = String::new();
+    for character in evidence.chars() {
+        if character.is_whitespace()
+            || matches!(character, '。' | '！' | '？' | '!' | '?' | '；' | ';')
+        {
+            let normalized = normalize_coverage_evidence(&current);
+            if normalized.chars().count() >= 4 {
+                fragments.push(normalized);
+            }
+            current.clear();
+        } else {
+            current.push(character);
+        }
+    }
+    let normalized = normalize_coverage_evidence(&current);
+    if normalized.chars().count() >= 4 {
+        fragments.push(normalized);
+    }
+    fragments.sort();
+    fragments.dedup();
+    fragments
 }
 
 pub(crate) fn coverage_gate_passes(
@@ -61,7 +108,7 @@ pub(crate) fn parse_rewrite_review_decision_output(
         .map(serde_json::from_value::<ReviewCoverageItem>)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("coverage 字段无效：{error}"))?;
-    let state_updates = value
+    let mut state_updates = value
         .get("state_updates")
         .and_then(serde_json::Value::as_array)
         .cloned()
@@ -70,6 +117,7 @@ pub(crate) fn parse_rewrite_review_decision_output(
         .map(serde_json::from_value::<RewriteStateUpdate>)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("state_updates 字段无效：{error}"))?;
+    canonicalize_review_state_updates(plan, &mut state_updates);
 
     let expected = plan
         .obligations
@@ -193,6 +241,45 @@ fn state_signature(state: &RewriteStateUpdate) -> (String, String, String, i64, 
     )
 }
 
+fn state_identity_signature(state: &RewriteStateUpdate) -> (String, String, i64, Vec<String>) {
+    let (_, _, _, chapter_index, source_ids) = state_signature(state);
+    (
+        state.thread_key.trim().to_string(),
+        state.state_type.trim().to_string(),
+        chapter_index,
+        source_ids,
+    )
+}
+
+fn unique_planned_states(plan: &RewritePlan) -> Vec<&RewriteStateUpdate> {
+    let mut seen = HashSet::new();
+    plan.planned_state_updates
+        .iter()
+        .chain(
+            plan.obligations
+                .iter()
+                .flat_map(|obligation| obligation.planned_state_updates.iter()),
+        )
+        .filter(|state| seen.insert(state_signature(state)))
+        .collect()
+}
+
+fn canonicalize_review_state_updates(plan: &RewritePlan, actual: &mut [RewriteStateUpdate]) {
+    let expected = unique_planned_states(plan);
+    for state in actual {
+        let identity = state_identity_signature(state);
+        let mut matches = expected
+            .iter()
+            .filter(|candidate| state_identity_signature(candidate) == identity);
+        let Some(first) = matches.next() else {
+            continue;
+        };
+        if matches.all(|candidate| state_signature(candidate) == state_signature(first)) {
+            *state = (**first).clone();
+        }
+    }
+}
+
 fn state_issue(state: &RewriteStateUpdate, problem: String, required_fix: String) -> ReviewIssue {
     ReviewIssue {
         chapter_indexes: vec![state.chapter_index],
@@ -208,15 +295,7 @@ pub(crate) fn validate_state_updates(
     plan: &RewritePlan,
     actual: &[RewriteStateUpdate],
 ) -> Vec<ReviewIssue> {
-    let expected = plan
-        .planned_state_updates
-        .iter()
-        .chain(
-            plan.obligations
-                .iter()
-                .flat_map(|obligation| obligation.planned_state_updates.iter()),
-        )
-        .collect::<Vec<_>>();
+    let expected = unique_planned_states(plan);
     let expected_signatures = expected
         .iter()
         .map(|state| state_signature(state))
@@ -401,6 +480,27 @@ mod tests {
     use crate::domain::RewriteObligation;
 
     #[test]
+    fn coverage_evidence_accepts_normalized_composite_quotes_but_not_fabrication() {
+        let rewrites = vec![ParsedChapterRewrite {
+            id: "chapter-3".to_string(),
+            index: 3,
+            title: "第三章".to_string(),
+            text: "她手掌轻轻拢了拢稀少的头发。中间还有一段叙述。大叔看着这姑娘病恹恹的样子，也不好意思靠太近。".to_string(),
+        }];
+        let mut item = ReviewCoverageItem {
+            obligation_id: "O-1".to_string(),
+            status: "satisfied".to_string(),
+            chapter_indexes: vec![3],
+            evidence: "她手掌轻轻拢了拢稀少的头发 大叔看着这姑娘病恹恹的样子，也不好意思靠太近!".to_string(),
+        };
+
+        assert!(evidence_exists_in_rewrite(&item, &rewrites));
+
+        item.evidence.push_str("；管理员主动送给她一份礼物");
+        assert!(!evidence_exists_in_rewrite(&item, &rewrites));
+    }
+
+    #[test]
     fn gate_rejects_partial_or_duplicate_coverage() {
         let plan = RewritePlan {
             plan_version: "protagonist-graph-v1".to_string(),
@@ -464,6 +564,46 @@ mod tests {
         let mut wrong_source = expected;
         wrong_source.source_obligation_ids = vec!["O-other".to_string()];
         assert!(!validate_state_updates(&plan, &[wrong_source]).is_empty());
+    }
+
+    #[test]
+    fn review_state_value_is_canonicalized_and_duplicate_plan_states_are_deduplicated() {
+        let expected = RewriteStateUpdate {
+            thread_key: "虫猿文明线".to_string(),
+            state_type: "关系状态".to_string(),
+            value: "主角创造虫猿，被其嘲讽‘谢顶’，小心眼记仇并决定日后报复"
+                .to_string(),
+            chapter_index: 4,
+            source_obligation_ids: vec!["O-1".to_string()],
+        };
+        let plan = RewritePlan {
+            plan_version: "protagonist-graph-v1".to_string(),
+            graph_additions: Vec::new(),
+            obligations: vec![RewriteObligation {
+                obligation_id: "O-1".to_string(),
+                node_id: "N-1".to_string(),
+                chapter_index: 4,
+                rule_ids: Vec::new(),
+                preserve: Vec::new(),
+                required_changes: Vec::new(),
+                deep_delta_categories: Vec::new(),
+                forbidden_regressions: Vec::new(),
+                downstream_effects: Vec::new(),
+                planned_state_updates: vec![expected.clone()],
+            }],
+            planned_state_updates: vec![expected.clone()],
+            cross_shard_dependencies: Vec::new(),
+        };
+        let mut actual = vec![RewriteStateUpdate {
+            value: "主角创造虫猿，被嘲讽‘谢顶’，小心眼记仇并决定日后报复".to_string(),
+            ..expected.clone()
+        }];
+
+        canonicalize_review_state_updates(&plan, &mut actual);
+
+        assert_eq!(actual, vec![expected]);
+        assert!(validate_state_updates(&plan, &actual).is_empty());
+        assert_eq!(validate_state_updates(&plan, &[]).len(), 1);
     }
 
     #[test]

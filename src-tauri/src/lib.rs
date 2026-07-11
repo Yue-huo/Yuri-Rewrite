@@ -3379,6 +3379,7 @@ fn merge_deterministic_protagonist_residue_issues(
     deterministic_issues.extend(detect_protagonist_name_logic_inconsistency(
         chapters, rewrites, settings,
     ));
+    deterministic_issues.extend(detect_mixed_group_pronoun_regressions(chapters, rewrites));
     if deterministic_issues.is_empty() {
         return (decision, Vec::new());
     }
@@ -4275,6 +4276,61 @@ pub(crate) fn parse_review_decision_output(
     Ok(ReviewDecision { approved, issues })
 }
 
+fn detect_mixed_group_pronoun_regressions(
+    chapters: &[Chapter],
+    rewrites: &[ParsedChapterRewrite],
+) -> Vec<ReviewIssue> {
+    let rewrites_by_id = rewrites
+        .iter()
+        .map(|rewrite| (rewrite.id.as_str(), rewrite))
+        .collect::<HashMap<_, _>>();
+    let replacements = [("他们家", "她们家"), ("他们一家", "她们一家")];
+    let male_family_terms = [
+        "父亲", "父母", "爸爸", "爸妈", "儿子", "兄弟", "哥哥", "弟弟", "丈夫", "爷爷",
+        "叔叔", "伯伯",
+    ];
+    let mut issues = Vec::new();
+    for chapter in chapters {
+        let Some(rewrite) = rewrites_by_id.get(chapter.id.as_str()) else {
+            continue;
+        };
+        let rewrite_text = format!("{}\n{}", rewrite.title, rewrite.text);
+        let sentences = split_review_sentences(&chapter.original_text);
+        for (source, target) in replacements {
+            if !rewrite_text.contains(target) {
+                continue;
+            }
+            let mixed_family_context = sentences.iter().enumerate().any(|(index, sentence)| {
+                if !sentence.contains(source) {
+                    return false;
+                }
+                let start = index.saturating_sub(1);
+                let end = (index + 2).min(sentences.len());
+                let context = sentences[start..end].join("");
+                contains_any(&context, &male_family_terms)
+            });
+            if !mixed_family_context {
+                continue;
+            }
+            issues.push(ReviewIssue {
+                chapter_indexes: vec![chapter.index],
+                scope: "chapter".to_string(),
+                category: "identity".to_string(),
+                severity: "blocking".to_string(),
+                problem: format!(
+                    "分片索引 {} 把原文混合性别家庭称呼“{}”误改为“{}”。",
+                    chapter.index, source, target
+                ),
+                required_fix: format!(
+                    "将“{}”改为“{}”或单数“她家”；家庭中的男性成员不得被复数女性代词覆盖。",
+                    target, source
+                ),
+            });
+        }
+    }
+    issues
+}
+
 fn build_targeted_revision_context(
     shard: &[Chapter],
     rewrites: &[ParsedChapterRewrite],
@@ -4909,7 +4965,7 @@ fn build_graph_review_decision_prompt(
 3. 姓名、代词、称谓或外貌变化不能单独证明义务满足；partial、missed、regressed 一律 blocking。
 4. coverage.evidence 必须逐字引用当前改写稿中真实存在的短证据；不得引用原文、契约或自行概括。
 5. 剧情、结果、能力、身份、关系性质、marker、边界或连续性回归均为 blocking。
-6. state_updates 必须与契约 planned_state_updates 一致，只报告本稿确实建立且可供后文使用的状态。
+6. state_updates 必须逐字段原样复制契约 planned_state_updates（包括 value），只报告本稿确实建立且可供后文使用的状态；不得概括、改写或新增状态。
 
 输出结构：
 {{
@@ -9593,6 +9649,41 @@ mod tests {
         assert_eq!(added.len(), 1);
         assert_eq!(decision.issues[0].chapter_indexes, vec![1]);
         assert!(review_issue_text(&decision.issues[0]).contains("小炎"));
+    }
+
+    #[test]
+    fn deterministic_scan_catches_blind_feminization_of_a_mixed_family_pronoun() {
+        let chapter = sample_chapter(
+            1,
+            "第一章",
+            "他们家在村里原先算是有矿。后来生意亏损，父母也气得倒下了。",
+        );
+        let rewrite = ParsedChapterRewrite {
+            id: chapter.id.clone(),
+            index: chapter.index,
+            title: chapter.title.clone(),
+            text: "她们家在村里原先算是有矿。后来生意亏损，父母也气得倒下了。"
+                .to_string(),
+        };
+
+        let issues = detect_mixed_group_pronoun_regressions(&[chapter], &[rewrite]);
+
+        assert_eq!(issues.len(), 1);
+        assert!(review_issue_text(&issues[0]).contains("她们家"));
+        assert!(review_issue_text(&issues[0]).contains("她家"));
+    }
+
+    #[test]
+    fn deterministic_scan_allows_an_all_female_family_group() {
+        let chapter = sample_chapter(1, "第一章", "他们家三姐妹一起回来了。");
+        let rewrite = ParsedChapterRewrite {
+            id: chapter.id.clone(),
+            index: chapter.index,
+            title: chapter.title.clone(),
+            text: "她们家三姐妹一起回来了。".to_string(),
+        };
+
+        assert!(detect_mixed_group_pronoun_regressions(&[chapter], &[rewrite]).is_empty());
     }
 
     #[test]
