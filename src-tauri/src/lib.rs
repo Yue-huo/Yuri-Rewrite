@@ -4072,7 +4072,7 @@ fn gender_residue_evidence_is_absent_from_rewrites(
 }
 
 fn is_gender_residue_claim(text: &str, category: &str) -> bool {
-    category.contains("gender")
+    category.to_ascii_lowercase().contains("gender")
         || contains_any(
             text,
             &[
@@ -4085,16 +4085,9 @@ fn is_gender_residue_claim(text: &str, category: &str) -> bool {
                 "男孩",
                 "少年",
                 "小子",
-                "他",
-                "残留",
-                "未改写",
-                "未修改",
-                "没有修改",
-                "没有被修改",
-                "没有被替换",
-                "仍为",
-                "仍是",
-                "仍然是",
+                "主角仍为男性",
+                "主角仍是男性",
+                "主角仍然是男性",
             ],
         )
 }
@@ -10233,6 +10226,36 @@ mod tests {
         assert!(filtered_decision.approved);
         assert!(filtered_decision.issues.is_empty());
         assert_eq!(filtered_issues.len(), 1);
+    }
+
+    #[test]
+    fn review_filter_never_reclassifies_continuity_as_gender_residue() {
+        let decision = ReviewDecision {
+            approved: false,
+            issues: vec![sample_review_issue(
+                vec![5, 6],
+                "cross_chapter",
+                "continuity",
+                "第5章把下一章内容提前写入；原文只到‘自己对他们来说，就是天神。’，不得跨章搬运。",
+            )],
+        };
+        let rewrites = vec![ParsedChapterRewrite {
+            id: "chapter-5".to_string(),
+            index: 5,
+            title: "第五章".to_string(),
+            text: "自己对他们来说，就是天神。".to_string(),
+        }];
+
+        let (filtered_decision, filtered_issues) = filter_review_decision_against_rewrites(
+            decision,
+            &[],
+            &rewrites,
+            &sample_novel_settings(),
+        );
+
+        assert!(!filtered_decision.approved);
+        assert_eq!(filtered_decision.issues.len(), 1);
+        assert!(filtered_issues.is_empty());
     }
 
     #[test]

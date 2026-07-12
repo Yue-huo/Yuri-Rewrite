@@ -3,8 +3,8 @@ use crate::domain::{
     ReviewIssue, RewritePlan, RewriteReviewDecision, RewriteStateUpdate,
 };
 use crate::{
-    parse_jsonish_value, parse_review_decision_output, to_string, upsert_canon_asset,
-    REWRITE_CONTINUITY_ASSET_KIND,
+    obligation_mode_rule, parse_jsonish_value, parse_review_decision_output, to_string,
+    upsert_canon_asset, REWRITE_CONTINUITY_ASSET_KIND,
 };
 use chrono::Utc;
 use rusqlite::params;
@@ -262,7 +262,11 @@ pub(crate) fn parse_rewrite_review_decision_output(
                 item.obligation_id, item.status
             ));
         }
-        let evidence_exists = evidence_exists_in_rewrite(item, rewrites);
+        let preserve_needs_no_change_evidence = obligation_mode_rule(&obligation.rule_ids)
+            == Some("R3_PRESERVE")
+            && obligation.required_changes.is_empty();
+        let evidence_exists = preserve_needs_no_change_evidence
+            || evidence_exists_in_rewrite(item, rewrites);
         if item.status != "satisfied" || !evidence_exists {
             decision.issues.push(ReviewIssue {
                 chapter_indexes: vec![obligation.chapter_index],
@@ -280,7 +284,7 @@ pub(crate) fn parse_rewrite_review_decision_output(
                 required_fix: format!(
                     "定向完成义务 {}：{}",
                     item.obligation_id,
-                    obligation.required_changes.join("；")
+                    obligation_fix_summary(obligation)
                 ),
             });
         }
@@ -296,7 +300,7 @@ pub(crate) fn parse_rewrite_review_decision_output(
                 required_fix: format!(
                     "验收并完成义务 {}：{}",
                     obligation.obligation_id,
-                    obligation.required_changes.join("；")
+                    obligation_fix_summary(obligation)
                 ),
             });
         }
@@ -308,6 +312,16 @@ pub(crate) fn parse_rewrite_review_decision_output(
         coverage,
         state_updates,
     })
+}
+
+fn obligation_fix_summary(obligation: &crate::domain::RewriteObligation) -> String {
+    if !obligation.required_changes.is_empty() {
+        obligation.required_changes.join("；")
+    } else if !obligation.preserve.is_empty() {
+        format!("按原文恢复并保留：{}", obligation.preserve.join("；"))
+    } else {
+        "按原文章节恢复该节点，不新增或跨章搬运内容".to_string()
+    }
 }
 
 fn canonical_planned_state_updates(plan: &RewritePlan) -> Vec<RewriteStateUpdate> {
@@ -677,7 +691,7 @@ mod tests {
         }];
         let output = r#"{
           "approved": true,
-          "coverage": [{"obligation_id":"O-1","status":"satisfied","chapter_indexes":[3],"evidence":"白纸与陈熙仍是普通朋友"}],
+          "coverage": [{"obligation_id":"O-1","status":"satisfied","chapter_indexes":[3],"evidence":"模型误引了不存在的后续对话"}],
           "issues": []
         }"#;
 
@@ -686,6 +700,54 @@ mod tests {
 
         assert!(parsed.decision.approved);
         assert_eq!(parsed.state_updates, vec![state]);
+    }
+
+    #[test]
+    fn preserve_regression_still_blocks_and_gets_an_actionable_fix() {
+        let obligation = RewriteObligation {
+            obligation_id: "O-1".to_string(),
+            node_id: "N-1".to_string(),
+            chapter_index: 5,
+            rule_ids: vec!["R3_PRESERVE".to_string()],
+            preserve: vec!["保留第五章结尾，不得提前搬入第六章对话".to_string()],
+            required_changes: Vec::new(),
+            deep_delta_categories: Vec::new(),
+            forbidden_regressions: Vec::new(),
+            downstream_effects: Vec::new(),
+            planned_state_updates: Vec::new(),
+        };
+
+        assert_eq!(
+            obligation_fix_summary(&obligation),
+            "按原文恢复并保留：保留第五章结尾，不得提前搬入第六章对话"
+        );
+        let plan = RewritePlan {
+            plan_version: "protagonist-graph-v2.2".to_string(),
+            graph_additions: Vec::new(),
+            obligations: vec![obligation],
+            planned_state_updates: Vec::new(),
+            cross_shard_dependencies: Vec::new(),
+        };
+        let rewrites = vec![ParsedChapterRewrite {
+            id: "chapter-5".to_string(),
+            index: 5,
+            title: "第五章".to_string(),
+            text: "正文仍在，但被提前搬入了后章对话。".to_string(),
+        }];
+        let output = r#"{
+          "approved": false,
+          "coverage": [{"obligation_id":"O-1","status":"regressed","chapter_indexes":[5],"evidence":"正文仍在"}],
+          "issues": []
+        }"#;
+
+        let parsed =
+            parse_rewrite_review_decision_output(output, &settings(), &plan, &rewrites).unwrap();
+        assert!(!parsed.decision.approved);
+        assert!(parsed
+            .decision
+            .issues
+            .iter()
+            .any(|issue| issue.required_fix.contains("按原文恢复并保留")));
     }
 
     #[test]

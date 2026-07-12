@@ -36,10 +36,6 @@ pub(crate) fn format_planning_nodes(nodes: &[SourceImpactNode]) -> String {
                 "presence_kind": node.presence_kind,
                 "participants": node.participants,
                 "source_evidence": node.source_evidence,
-                "narrative_function": node.narrative_function,
-                "gender_mechanisms": node.gender_mechanisms,
-                "state_before": node.state_before,
-                "state_after": node.state_after,
                 "thread_keys": node.thread_keys,
                 "links": node.links,
             })
@@ -58,10 +54,6 @@ pub(crate) fn format_execution_nodes(nodes: &[SourceImpactNode]) -> String {
                 "presence_kind": node.presence_kind,
                 "participants": node.participants,
                 "source_evidence": node.source_evidence,
-                "narrative_function": node.narrative_function,
-                "gender_mechanisms": node.gender_mechanisms,
-                "state_before": node.state_before,
-                "state_after": node.state_after,
                 "thread_keys": node.thread_keys,
             })
         })
@@ -321,6 +313,8 @@ mod tests {
 
         assert!(planning.contains("source_evidence"));
         assert!(execution.contains("source_evidence"));
+        assert!(!planning.contains("narrative_function"));
+        assert!(!execution.contains("state_after"));
         assert!(!execution.contains("confidence"));
         assert!(!execution.contains("links"));
         assert!(execution.len() < planning.len());

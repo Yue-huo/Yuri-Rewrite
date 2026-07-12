@@ -1,5 +1,5 @@
 pub(crate) const PROTAGONIST_GRAPH_STRATEGY: &str = "protagonist_graph_v1";
-pub(crate) const PROTAGONIST_RULE_PACK_VERSION: &str = "protagonist-graph-v2.1";
+pub(crate) const PROTAGONIST_RULE_PACK_VERSION: &str = "protagonist-graph-v2.2";
 pub(crate) const LEGACY_REWRITE_STRATEGY: &str = "legacy";
 pub(crate) const REWRITE_CHECK_OFF: &str = "off";
 pub(crate) const REWRITE_CHECK_TAGGED: &str = "tagged";
@@ -50,7 +50,7 @@ pub(crate) fn graph_strategy_name_enabled(strategy: &str) -> bool {
 }
 
 pub(crate) fn protagonist_rule_pack() -> &'static str {
-    r#"【protagonist-graph-v2.1 规则包】
+    r#"【protagonist-graph-v2.2 规则包】
 R0_FORMAT：章节 marker、范围、顺序、标题和纯正文输出最高优先级。
 R1_PLOT_ABILITY：保留原著事件功能、因果、战力、能力、人物动机和关键结果。
 R2_IDENTITY_MAPPING：姓名映射和用户指定性转角色必须一致；未指定角色保持原身份与性别。

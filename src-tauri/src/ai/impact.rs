@@ -310,7 +310,7 @@ pub(crate) fn build_rewrite_plan_prompt(
 4. 只有身体差异、明确性别称谓、恋爱/婚姻、性别化社会角色、身体接触边界或其他有原文证据的性别因果，才选择 R3_CAUSAL_TRANSFORM 并规划最小充分变化。仅需处理原文明示的性别称谓、身体差异或场景相关外貌时选择 R3_SURFACE_ADAPT，deep_delta_categories 留空；如果只有姓名/代词替换，必须选择 R3_PRESERVE。只有前序已确认变化确实传导到本节点时选择 R3_DERIVED_TRANSFORM，并逐字列出依赖标识。
 5. 保留原著事件、结果、能力、人物动机和关系性质；不得凭空增加恋爱对象、重大事件或剧情分支。
 6. 复核原文是否漏掉主角直接出现、被提及或造成后果的节点；遗漏节点放入 graph_additions，并立即为其创建 obligation。graph_additions.node_id 使用 `new-章节index-序号`，对应 obligation.node_id 必须相同。
-7. source_evidence 必须逐字摘自原文，不得概括或改写。
+7. source_evidence 必须逐字摘自原文，不得概括或改写。影响图投影中的 thread_keys 和 links 只用于定位关系线，不是内容证据；当前章节 marker 内的原文和 source_evidence 才是硬依据。每项 preserve、required_changes、downstream_effects 都只能描述该 obligation.chapter_index 章节中实际存在的内容，严禁把下一章的对话、结果或关系推进提前写入当前章契约。
 8. 如果提供“当前改写稿”，比较其与原文：已经满足深层变化的节点仍保留一项验收义务，并在 preserve 中写明保持现有处理；未满足节点和本次新要求进入修复义务，避免破坏已经成立的改写。
 9. 阅读前序分片契约。如果当前义务依赖前序 node_id、obligation_id、thread_key 或计划状态，把前序摘要中实际出现的稳定标识逐字复制到 cross_shard_dependencies。不得引用当前分片新建的标识，也不得缩写、改名或概括前序 thread_key。该字段必须是扁平字符串数组（例如 ["obligation:O-xxx", "thread:许纸与吉尔伽美什的师徒/神人关系线"]），严禁输出对象；无依赖时返回空数组。
 10. 改写连续性状态只记录“本次性转改写新产生且后文必须承接”的关系、互动边界、称谓、外貌或身份状态；原著已有的能力、事件、决定、物种、地点和剧情进度属于原著事实，不得重复写入。obligations[].planned_state_updates 固定为空数组；只在最外层 planned_state_updates 写每个 (thread_key, state_type) 的最终状态，并包含当前分片 chapter_index 和非空 source_obligation_ids。多数 R3_PRESERVE 分片应返回空数组。
@@ -325,7 +325,7 @@ pub(crate) fn build_rewrite_plan_prompt(
 
 只输出此结构：
 {{
-  "plan_version": "protagonist-graph-v2.1",
+  "plan_version": "protagonist-graph-v2.2",
   "graph_additions": [],
   "obligations": [{{
     "obligation_id": "O-节点ID",
@@ -1367,7 +1367,7 @@ mod tests {
         )
         .unwrap();
         let valid = format!(
-            r#"{{"plan_version":"protagonist-graph-v2.1","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_PRESERVE"],"preserve":["保留中性的推门入场和药老原反应"],"required_changes":[],"deep_delta_categories":[]}}]}}"#,
+            r#"{{"plan_version":"protagonist-graph-v2.2","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_PRESERVE"],"preserve":["保留中性的推门入场和药老原反应"],"required_changes":[],"deep_delta_categories":[]}}]}}"#,
             nodes[0].node_id
         );
         assert!(
@@ -1445,7 +1445,7 @@ mod tests {
         )
         .unwrap();
         let output = format!(
-            r#"{{"plan_version":"protagonist-graph-v2.1","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_CAUSAL_TRANSFORM"],"required_changes":["让药老对她的入场方式产生有原文依据的反应"],"deep_delta_categories":["other_reaction"]}}],"cross_shard_dependencies":[{{"obligation_id":"O-prior","reason":"承接前序状态"}}]}}"#,
+            r#"{{"plan_version":"protagonist-graph-v2.2","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_CAUSAL_TRANSFORM"],"required_changes":["让药老对她的入场方式产生有原文依据的反应"],"deep_delta_categories":["other_reaction"]}}],"cross_shard_dependencies":[{{"obligation_id":"O-prior","reason":"承接前序状态"}}]}}"#,
             nodes[0].node_id
         );
 
@@ -1460,7 +1460,7 @@ mod tests {
 
     #[test]
     fn planner_rejects_dependency_objects_without_a_stable_identifier() {
-        let output = r#"{"plan_version":"protagonist-graph-v2.1","cross_shard_dependencies":[{"reason":"承接前序状态"}]}"#;
+        let output = r#"{"plan_version":"protagonist-graph-v2.2","cross_shard_dependencies":[{"reason":"承接前序状态"}]}"#;
         let error = parse_and_validate_rewrite_plan(output, &[], &[]).unwrap_err();
         assert!(error.contains("缺少 obligation_id、node_id 或 thread_key"));
     }
@@ -1469,7 +1469,7 @@ mod tests {
     fn planner_addition_gets_stable_ids_and_remaps_state_provenance() {
         let chapter = chapter();
         let output = r#"{
-          "plan_version":"protagonist-graph-v2.1",
+          "plan_version":"protagonist-graph-v2.2",
           "graph_additions":[{
             "node_id":"new-1-1",
             "chapter_index":1,
@@ -1656,7 +1656,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let plan = RewritePlan {
-            plan_version: "protagonist-graph-v2.1".to_string(),
+            plan_version: "protagonist-graph-v2.2".to_string(),
             graph_additions: Vec::new(),
             obligations,
             planned_state_updates: Vec::new(),
