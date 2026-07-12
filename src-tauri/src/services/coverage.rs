@@ -117,7 +117,7 @@ fn extract_quoted_coverage_evidence(evidence: &str) -> Vec<String> {
             } else if character == close {
                 if let Some(start_index) = start.take() {
                     let normalized = normalize_coverage_evidence(&evidence[start_index..index]);
-                    if normalized.chars().count() >= 4 {
+                    if normalized.chars().count() >= 3 {
                         fragments.push(normalized);
                     }
                 } else if open == close {
@@ -149,7 +149,7 @@ fn split_coverage_evidence(evidence: &str) -> Vec<String> {
             )
         {
             let normalized = normalize_coverage_evidence(&current);
-            if normalized.chars().count() >= 4 {
+            if normalized.chars().count() >= 3 {
                 fragments.push(normalized);
             }
             current.clear();
@@ -158,7 +158,7 @@ fn split_coverage_evidence(evidence: &str) -> Vec<String> {
         }
     }
     let normalized = normalize_coverage_evidence(&current);
-    if normalized.chars().count() >= 4 {
+    if normalized.chars().count() >= 3 {
         fragments.push(normalized);
     }
     fragments.sort();
@@ -204,16 +204,10 @@ pub(crate) fn parse_rewrite_review_decision_output(
         .map(serde_json::from_value::<ReviewCoverageItem>)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("coverage 字段无效：{error}"))?;
-    let mut state_updates = value
-        .get("state_updates")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(serde_json::from_value::<RewriteStateUpdate>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("state_updates 字段无效：{error}"))?;
-    canonicalize_review_state_updates(plan, &mut state_updates);
+    // Continuity updates are contract data, not a model judgment. Requiring the reviewer to
+    // reproduce a potentially long array caused false quality-gate failures from omitted or
+    // slightly rewritten metadata. Once coverage passes, persist the canonical plan states.
+    let state_updates = canonical_planned_state_updates(plan);
 
     let expected = plan
         .obligations
@@ -308,9 +302,6 @@ pub(crate) fn parse_rewrite_review_decision_output(
         }
     }
 
-    decision
-        .issues
-        .extend(validate_state_updates(plan, &state_updates));
     decision.approved = coverage_gate_passes(plan, &coverage, &decision.issues);
     Ok(RewriteReviewDecision {
         decision,
@@ -319,36 +310,7 @@ pub(crate) fn parse_rewrite_review_decision_output(
     })
 }
 
-fn state_signature(state: &RewriteStateUpdate) -> (String, String, String, i64, Vec<String>) {
-    let mut source_ids = state
-        .source_obligation_ids
-        .iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    source_ids.sort();
-    source_ids.dedup();
-    (
-        state.thread_key.trim().to_string(),
-        state.state_type.trim().to_string(),
-        state.value.trim().to_string(),
-        state.chapter_index,
-        source_ids,
-    )
-}
-
-fn state_identity_signature(state: &RewriteStateUpdate) -> (String, String, i64, Vec<String>) {
-    let (_, _, _, chapter_index, source_ids) = state_signature(state);
-    (
-        state.thread_key.trim().to_string(),
-        state.state_type.trim().to_string(),
-        chapter_index,
-        source_ids,
-    )
-}
-
-fn unique_planned_states(plan: &RewritePlan) -> Vec<&RewriteStateUpdate> {
-    let mut seen = HashSet::new();
+fn canonical_planned_state_updates(plan: &RewritePlan) -> Vec<RewriteStateUpdate> {
     let states = if plan.planned_state_updates.is_empty() {
         plan.obligations
             .iter()
@@ -357,128 +319,30 @@ fn unique_planned_states(plan: &RewritePlan) -> Vec<&RewriteStateUpdate> {
     } else {
         plan.planned_state_updates.iter().collect::<Vec<_>>()
     };
-    states
-        .into_iter()
-        .filter(|state| seen.insert(state_signature(state)))
-        .collect()
-}
-
-fn canonicalize_review_state_updates(plan: &RewritePlan, actual: &mut [RewriteStateUpdate]) {
-    let expected = unique_planned_states(plan);
-    for state in actual {
-        let identity = state_identity_signature(state);
-        let mut matches = expected
-            .iter()
-            .filter(|candidate| state_identity_signature(candidate) == identity);
-        let Some(first) = matches.next() else {
-            continue;
-        };
-        if matches.all(|candidate| state_signature(candidate) == state_signature(first)) {
-            *state = (**first).clone();
+    let mut positions = HashMap::<(String, String), usize>::new();
+    let mut canonical = Vec::<RewriteStateUpdate>::new();
+    for state in states {
+        let key = (
+            state.thread_key.trim().to_string(),
+            state.state_type.trim().to_string(),
+        );
+        if let Some(position) = positions.get(&key).copied() {
+            if state.chapter_index > canonical[position].chapter_index {
+                canonical[position] = state.clone();
+            }
+        } else {
+            positions.insert(key, canonical.len());
+            canonical.push(state.clone());
         }
     }
-}
-
-fn state_issue(state: &RewriteStateUpdate, problem: String, required_fix: String) -> ReviewIssue {
-    ReviewIssue {
-        chapter_indexes: vec![state.chapter_index],
-        scope: "cross_chapter".to_string(),
-        category: "continuity".to_string(),
-        severity: "blocking".to_string(),
-        problem,
-        required_fix,
-    }
-}
-
-pub(crate) fn validate_state_updates(
-    plan: &RewritePlan,
-    actual: &[RewriteStateUpdate],
-) -> Vec<ReviewIssue> {
-    let expected = unique_planned_states(plan);
-    let expected_signatures = expected
-        .iter()
-        .map(|state| state_signature(state))
-        .collect::<HashSet<_>>();
-    let actual_signatures = actual.iter().map(state_signature).collect::<Vec<_>>();
-    let mut issues = Vec::new();
-    let mut seen_actual = HashSet::new();
-    for (state, signature) in actual.iter().zip(actual_signatures.iter()) {
-        let normalized_source_count = state
-            .source_obligation_ids
-            .iter()
-            .map(|id| id.trim())
-            .filter(|id| !id.is_empty())
-            .collect::<HashSet<_>>()
-            .len();
-        if normalized_source_count != state.source_obligation_ids.len() {
-            issues.push(state_issue(
-                state,
-                format!(
-                    "复检状态 {} / {} 的来源义务 ID 为空或重复。",
-                    state.thread_key, state.state_type
-                ),
-                "source_obligation_ids 必须为非空且不重复的契约义务 ID。".to_string(),
-            ));
-        }
-        if !seen_actual.insert(signature.clone()) {
-            issues.push(state_issue(
-                state,
-                format!(
-                    "复检重复返回状态 {} / {} / 第{}章。",
-                    state.thread_key, state.state_type, state.chapter_index
-                ),
-                "每个计划状态只能返回一次。".to_string(),
-            ));
-        } else if !expected_signatures.contains(signature) {
-            let same_value = expected.iter().find(|expected_state| {
-                expected_state.thread_key.trim() == state.thread_key.trim()
-                    && expected_state.state_type.trim() == state.state_type.trim()
-                    && expected_state.value.trim() == state.value.trim()
-            });
-            let required_fix = same_value.map_or_else(
-                || "删除未计划状态，或重新规划后再生成正文。".to_string(),
-                |expected_state| {
-                    format!(
-                        "必须使用计划章节 {} 和来源义务 [{}]。",
-                        expected_state.chapter_index,
-                        expected_state.source_obligation_ids.join("、")
-                    )
-                },
-            );
-            issues.push(state_issue(
-                state,
-                format!(
-                    "复检状态与契约不完全一致：{} / {} / 第{}章 / 来源 [{}]。",
-                    state.thread_key,
-                    state.state_type,
-                    state.chapter_index,
-                    state.source_obligation_ids.join("、")
-                ),
-                required_fix,
-            ));
-        }
-    }
-    let actual_set = actual_signatures.into_iter().collect::<HashSet<_>>();
-    for expected_state in expected {
-        let signature = state_signature(expected_state);
-        if !actual_set.contains(&signature) {
-            issues.push(state_issue(
-                expected_state,
-                format!(
-                    "复检遗漏计划状态 {} / {} / 第{}章 / 来源 [{}]。",
-                    expected_state.thread_key,
-                    expected_state.state_type,
-                    expected_state.chapter_index,
-                    expected_state.source_obligation_ids.join("、")
-                ),
-                format!(
-                    "修复正文后返回完整计划状态；来源义务必须为 [{}]。",
-                    expected_state.source_obligation_ids.join("、")
-                ),
-            ));
-        }
-    }
-    issues
+    canonical.sort_by_key(|state| {
+        (
+            state.chapter_index,
+            state.thread_key.clone(),
+            state.state_type.clone(),
+        )
+    });
+    canonical
 }
 
 pub(crate) fn merge_continuity_states(
@@ -581,6 +445,22 @@ mod tests {
     use super::*;
     use crate::domain::RewriteObligation;
 
+    fn settings() -> NovelSettings {
+        NovelSettings {
+            novel_id: "novel-1".to_string(),
+            protagonist_name: "许纸".to_string(),
+            protagonist_aliases: String::new(),
+            rewritten_protagonist_name: "白纸".to_string(),
+            additional_feminize_names: String::new(),
+            bust: "普通".to_string(),
+            body_type: "少女".to_string(),
+            rewrite_mode: "strict".to_string(),
+            advanced_settings: String::new(),
+            relationship_targets: "[]".to_string(),
+            updated_at: "now".to_string(),
+        }
+    }
+
     #[test]
     fn coverage_evidence_accepts_a_real_fragment_majority_but_not_half_fabrication() {
         let rewrites = vec![ParsedChapterRewrite {
@@ -665,6 +545,25 @@ mod tests {
     }
 
     #[test]
+    fn coverage_evidence_counts_specific_three_character_terms() {
+        let rewrites = vec![ParsedChapterRewrite {
+            id: "chapter-3".to_string(),
+            index: 3,
+            title: "第三章".to_string(),
+            text: "白纸发现海生动物已经登陆，又用清秀的字迹记录下光武纪的后面一页，并命名为新生纪。".to_string(),
+        }];
+        let item = ReviewCoverageItem {
+            obligation_id: "O-1".to_string(),
+            status: "satisfied".to_string(),
+            chapter_indexes: vec![3],
+            evidence: "白纸观察到；又用清秀的字迹记录下光武纪的后面一页；新生纪"
+                .to_string(),
+        };
+
+        assert!(evidence_exists_in_rewrite(&item, &rewrites));
+    }
+
+    #[test]
     fn gate_rejects_partial_or_duplicate_coverage() {
         let plan = RewritePlan {
             plan_version: "protagonist-graph-v1".to_string(),
@@ -694,80 +593,99 @@ mod tests {
     }
 
     #[test]
-    fn state_updates_require_exact_chapter_and_source_obligation_ids() {
-        let expected = RewriteStateUpdate {
-            thread_key: "承诺线".to_string(),
+    fn reviewer_state_echo_is_ignored_and_plan_states_are_canonicalized() {
+        let first = RewriteStateUpdate {
+            thread_key: "基因获取线".to_string(),
+            state_type: "获得".to_string(),
+            value: "白纸购得猩猩血液并约定长期合作".to_string(),
+            chapter_index: 3,
+            source_obligation_ids: vec!["O-1".to_string()],
+        };
+        let duplicate = RewriteStateUpdate {
+            value: "白纸购得猩猩血液".to_string(),
+            source_obligation_ids: vec!["O-2".to_string()],
+            ..first.clone()
+        };
+        let plan = RewritePlan {
+            plan_version: "protagonist-graph-v2".to_string(),
+            graph_additions: Vec::new(),
+            obligations: vec![
+                RewriteObligation {
+                    obligation_id: "O-1".to_string(),
+                    node_id: "N-1".to_string(),
+                    chapter_index: 3,
+                    rule_ids: Vec::new(),
+                    preserve: Vec::new(),
+                    required_changes: Vec::new(),
+                    deep_delta_categories: Vec::new(),
+                    forbidden_regressions: Vec::new(),
+                    downstream_effects: Vec::new(),
+                    planned_state_updates: vec![first.clone()],
+                },
+                RewriteObligation {
+                    obligation_id: "O-2".to_string(),
+                    node_id: "N-2".to_string(),
+                    chapter_index: 3,
+                    rule_ids: Vec::new(),
+                    preserve: Vec::new(),
+                    required_changes: Vec::new(),
+                    deep_delta_categories: Vec::new(),
+                    forbidden_regressions: Vec::new(),
+                    downstream_effects: Vec::new(),
+                    planned_state_updates: vec![duplicate],
+                },
+            ],
+            planned_state_updates: Vec::new(),
+            cross_shard_dependencies: Vec::new(),
+        };
+
+        assert_eq!(canonical_planned_state_updates(&plan), vec![first]);
+    }
+
+    #[test]
+    fn review_can_pass_without_echoing_contract_state_metadata() {
+        let state = RewriteStateUpdate {
+            thread_key: "人际关系线".to_string(),
             state_type: "边界".to_string(),
-            value: "已经约定不再隐瞒".to_string(),
+            value: "白纸与陈熙保持普通朋友关系".to_string(),
             chapter_index: 3,
             source_obligation_ids: vec!["O-1".to_string()],
         };
         let plan = RewritePlan {
-            plan_version: "protagonist-graph-v1".to_string(),
+            plan_version: "protagonist-graph-v2".to_string(),
             graph_additions: Vec::new(),
             obligations: vec![RewriteObligation {
                 obligation_id: "O-1".to_string(),
                 node_id: "N-1".to_string(),
                 chapter_index: 3,
-                rule_ids: Vec::new(),
-                preserve: Vec::new(),
+                rule_ids: vec!["R3_PRESERVE".to_string()],
+                preserve: vec!["保留普通朋友关系".to_string()],
                 required_changes: Vec::new(),
                 deep_delta_categories: Vec::new(),
                 forbidden_regressions: Vec::new(),
                 downstream_effects: Vec::new(),
-                planned_state_updates: vec![expected.clone()],
+                planned_state_updates: vec![state.clone()],
             }],
             planned_state_updates: Vec::new(),
             cross_shard_dependencies: Vec::new(),
         };
-
-        assert!(validate_state_updates(&plan, std::slice::from_ref(&expected)).is_empty());
-        let mut wrong_chapter = expected.clone();
-        wrong_chapter.chapter_index = 4;
-        assert!(!validate_state_updates(&plan, &[wrong_chapter]).is_empty());
-        let mut wrong_source = expected;
-        wrong_source.source_obligation_ids = vec!["O-other".to_string()];
-        assert!(!validate_state_updates(&plan, &[wrong_source]).is_empty());
-    }
-
-    #[test]
-    fn review_state_value_is_canonicalized_and_duplicate_plan_states_are_deduplicated() {
-        let expected = RewriteStateUpdate {
-            thread_key: "虫猿文明线".to_string(),
-            state_type: "关系状态".to_string(),
-            value: "主角创造虫猿，被其嘲讽‘谢顶’，小心眼记仇并决定日后报复"
-                .to_string(),
-            chapter_index: 4,
-            source_obligation_ids: vec!["O-1".to_string()],
-        };
-        let plan = RewritePlan {
-            plan_version: "protagonist-graph-v1".to_string(),
-            graph_additions: Vec::new(),
-            obligations: vec![RewriteObligation {
-                obligation_id: "O-1".to_string(),
-                node_id: "N-1".to_string(),
-                chapter_index: 4,
-                rule_ids: Vec::new(),
-                preserve: Vec::new(),
-                required_changes: Vec::new(),
-                deep_delta_categories: Vec::new(),
-                forbidden_regressions: Vec::new(),
-                downstream_effects: Vec::new(),
-                planned_state_updates: vec![expected.clone()],
-            }],
-            planned_state_updates: vec![expected.clone()],
-            cross_shard_dependencies: Vec::new(),
-        };
-        let mut actual = vec![RewriteStateUpdate {
-            value: "主角创造虫猿，被嘲讽‘谢顶’，小心眼记仇并决定日后报复".to_string(),
-            ..expected.clone()
+        let rewrites = vec![ParsedChapterRewrite {
+            id: "chapter-3".to_string(),
+            index: 3,
+            title: "第三章".to_string(),
+            text: "白纸与陈熙仍是普通朋友。".to_string(),
         }];
+        let output = r#"{
+          "approved": true,
+          "coverage": [{"obligation_id":"O-1","status":"satisfied","chapter_indexes":[3],"evidence":"白纸与陈熙仍是普通朋友"}],
+          "issues": []
+        }"#;
 
-        canonicalize_review_state_updates(&plan, &mut actual);
+        let parsed =
+            parse_rewrite_review_decision_output(output, &settings(), &plan, &rewrites).unwrap();
 
-        assert_eq!(actual, vec![expected]);
-        assert!(validate_state_updates(&plan, &actual).is_empty());
-        assert_eq!(validate_state_updates(&plan, &[]).len(), 1);
+        assert!(parsed.decision.approved);
+        assert_eq!(parsed.state_updates, vec![state]);
     }
 
     #[test]
@@ -811,7 +729,7 @@ mod tests {
             cross_shard_dependencies: Vec::new(),
         };
 
-        assert!(validate_state_updates(&plan, &[final_state]).is_empty());
+        assert_eq!(canonical_planned_state_updates(&plan), vec![final_state]);
     }
 
     #[test]

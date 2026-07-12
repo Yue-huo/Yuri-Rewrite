@@ -1,5 +1,6 @@
 use crate::domain::{
-    Chapter, NovelSettings, RewriteObligation, RewritePlan, SourceImpactLink, SourceImpactNode,
+    Chapter, NovelSettings, RewriteObligation, RewritePlan, RewriteStateUpdate, SourceImpactLink,
+    SourceImpactNode,
 };
 use crate::{
     format_planning_nodes, format_prior_contract_context, parse_jsonish_value,
@@ -305,14 +306,14 @@ pub(crate) fn build_rewrite_plan_prompt(
 硬性规划规则：
 1. 当前分片中每个主角影响节点必须恰好对应一个 obligation；不能遗漏、合并或重复 node_id。
 2. 每个 obligation 的 rule_ids 必须且只能包含一个节点模式：R3_CAUSAL_TRANSFORM、R3_SURFACE_ADAPT、R3_PRESERVE 或 R3_DERIVED_TRANSFORM。先分类，再决定是否修改；绝不能为了证明“改过”而制造变化。
-3. 使用反事实检验：若只替换主角姓名、代词和必要称谓后，原场景的事件、心理、动作、互动、评价与关系仍自然成立，就必须选择 R3_PRESERVE；该模式 required_changes 和 deep_delta_categories 均为空，并在 preserve 中写明原样保留的中性内容。
-4. 只有身体差异、明确性别称谓、恋爱/婚姻、性别化社会角色、身体接触边界或其他有原文证据的性别因果，才选择 R3_CAUSAL_TRANSFORM 并规划最小充分变化。仅需姓名、代词、明确性别称谓或场景相关外貌适配时选择 R3_SURFACE_ADAPT，deep_delta_categories 留空。只有前序已确认变化确实传导到本节点时选择 R3_DERIVED_TRANSFORM，并逐字列出依赖标识。
+3. 使用反事实检验：若统一执行全局主角姓名/代词映射后，原场景的事件、心理、动作、互动、评价与关系仍自然成立，就必须选择 R3_PRESERVE；该模式 required_changes 和 deep_delta_categories 均为空，并在 preserve 中写明原样保留的中性内容。姓名和代词映射由正文阶段统一执行，不得为每个节点重复写入 required_changes。
+4. 只有身体差异、明确性别称谓、恋爱/婚姻、性别化社会角色、身体接触边界或其他有原文证据的性别因果，才选择 R3_CAUSAL_TRANSFORM 并规划最小充分变化。仅需处理原文明示的性别称谓、身体差异或场景相关外貌时选择 R3_SURFACE_ADAPT，deep_delta_categories 留空；如果只有姓名/代词替换，必须选择 R3_PRESERVE。只有前序已确认变化确实传导到本节点时选择 R3_DERIVED_TRANSFORM，并逐字列出依赖标识。
 5. 保留原著事件、结果、能力、人物动机和关系性质；不得凭空增加恋爱对象、重大事件或剧情分支。
 6. 复核原文是否漏掉主角直接出现、被提及或造成后果的节点；遗漏节点放入 graph_additions，并立即为其创建 obligation。graph_additions.node_id 使用 `new-章节index-序号`，对应 obligation.node_id 必须相同。
 7. source_evidence 必须逐字摘自原文，不得概括或改写。
 8. 如果提供“当前改写稿”，比较其与原文：已经满足深层变化的节点仍保留一项验收义务，并在 preserve 中写明保持现有处理；未满足节点和本次新要求进入修复义务，避免破坏已经成立的改写。
 9. 阅读前序分片契约。如果当前义务依赖前序 node_id、obligation_id、thread_key 或计划状态，把前序摘要中实际出现的稳定标识逐字复制到 cross_shard_dependencies。不得引用当前分片新建的标识，也不得缩写、改名或概括前序 thread_key。该字段必须是扁平字符串数组（例如 ["obligation:O-xxx", "thread:许纸与吉尔伽美什的师徒/神人关系线"]），严禁输出对象；无依赖时返回空数组。
-10. 每个 planned_state_updates 项必须包含 thread_key、state_type、value、当前分片 chapter_index 和非空 source_obligation_ids；义务内部的状态必须把该义务自身 ID 列为来源。
+10. 改写连续性状态只记录“本次性转改写新产生且后文必须承接”的关系、互动边界、称谓、外貌或身份状态；原著已有的能力、事件、决定、物种、地点和剧情进度属于原著事实，不得重复写入。obligations[].planned_state_updates 固定为空数组；只在最外层 planned_state_updates 写每个 (thread_key, state_type) 的最终状态，并包含当前分片 chapter_index 和非空 source_obligation_ids。多数 R3_PRESERVE 分片应返回空数组。
 11. required_changes 只写最终必须验收的可见结果，使用简短独立数组项；不要把“可能、可以、例如、比如、如……”等可选实现示例混入硬要求。需要某个具体动作或反应时直接写成必须发生的结果。
 12. 原著影响图的 thread_key 为保持稳定可以含原主角姓名，但 planned_state_updates.value 必须使用目标改写名或“主角”，不得把原名、原名别名写进将传给后文的连续性状态。
 13. 禁止把“女性视角”“女性特有”“同为女子”“身为女性/女人”“我一个女人”“枉为女性”、母性、柔弱、细腻、爱美或购物偏好当作变化理由。普通女性关系不得自动改成闺蜜、暧昧、依赖或母女关系。
@@ -324,7 +325,7 @@ pub(crate) fn build_rewrite_plan_prompt(
 
 只输出此结构：
 {{
-  "plan_version": "protagonist-graph-v2",
+  "plan_version": "protagonist-graph-v2.1",
   "graph_additions": [],
   "obligations": [{{
     "obligation_id": "O-节点ID",
@@ -332,19 +333,19 @@ pub(crate) fn build_rewrite_plan_prompt(
     "chapter_index": 1,
     "rule_ids": ["R3_CAUSAL_TRANSFORM", "R4_MINIMAL_CAUSALITY"],
     "preserve": ["必须保留的剧情功能"],
-    "required_changes": ["反事实检验确认必要的最小变化；R3_PRESERVE 时为空数组"],
+    "required_changes": ["反事实检验确认必要的最小变化；姓名/代词不在此重复，R3_PRESERVE 时为空数组"],
     "deep_delta_categories": ["other_reaction"],
     "forbidden_regressions": ["不能引入的退化"],
     "downstream_effects": ["后续必须承接的影响"],
-    "planned_state_updates": [{{
-      "thread_key": "关系线",
-      "state_type": "边界或承诺类型",
-      "value": "本章建立的最新状态",
-      "chapter_index": 1,
-      "source_obligation_ids": ["O-节点ID"]
-    }}]
+    "planned_state_updates": []
   }}],
-  "planned_state_updates": [],
+  "planned_state_updates": [{{
+    "thread_key": "仅限本次改写新产生且后文必须承接的关系线",
+    "state_type": "边界或称谓类型",
+    "value": "当前分片最终有效状态",
+    "chapter_index": 1,
+    "source_obligation_ids": ["O-节点ID"]
+  }}],
   "cross_shard_dependencies": []
 }}
 
@@ -495,7 +496,46 @@ pub(crate) fn parse_and_validate_rewrite_plan(
         return Err(format!("改写契约遗漏主角节点：{}", missing.join("、")));
     }
     validate_plan_state_updates(&plan, chapters)?;
+    canonicalize_plan_state_updates(&mut plan);
     Ok(plan)
+}
+
+fn canonicalize_plan_state_updates(plan: &mut RewritePlan) {
+    let candidates = if plan.planned_state_updates.is_empty() {
+        plan.obligations
+            .iter()
+            .flat_map(|obligation| obligation.planned_state_updates.iter().cloned())
+            .collect::<Vec<_>>()
+    } else {
+        plan.planned_state_updates.clone()
+    };
+    let mut positions = HashMap::<(String, String), usize>::new();
+    let mut canonical = Vec::<RewriteStateUpdate>::new();
+    for state in candidates {
+        let key = (
+            state.thread_key.trim().to_string(),
+            state.state_type.trim().to_string(),
+        );
+        if let Some(position) = positions.get(&key).copied() {
+            if state.chapter_index > canonical[position].chapter_index {
+                canonical[position] = state;
+            }
+        } else {
+            positions.insert(key, canonical.len());
+            canonical.push(state);
+        }
+    }
+    canonical.sort_by_key(|state| {
+        (
+            state.chapter_index,
+            state.thread_key.clone(),
+            state.state_type.clone(),
+        )
+    });
+    plan.planned_state_updates = canonical;
+    for obligation in &mut plan.obligations {
+        obligation.planned_state_updates.clear();
+    }
 }
 
 fn normalize_cross_shard_dependencies(value: &mut serde_json::Value) -> Result<(), String> {
@@ -1327,7 +1367,7 @@ mod tests {
         )
         .unwrap();
         let valid = format!(
-            r#"{{"plan_version":"protagonist-graph-v2","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_PRESERVE"],"preserve":["保留中性的推门入场和药老原反应"],"required_changes":[],"deep_delta_categories":[]}}]}}"#,
+            r#"{{"plan_version":"protagonist-graph-v2.1","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_PRESERVE"],"preserve":["保留中性的推门入场和药老原反应"],"required_changes":[],"deep_delta_categories":[]}}]}}"#,
             nodes[0].node_id
         );
         assert!(
@@ -1405,7 +1445,7 @@ mod tests {
         )
         .unwrap();
         let output = format!(
-            r#"{{"plan_version":"protagonist-graph-v2","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_CAUSAL_TRANSFORM"],"required_changes":["让药老对她的入场方式产生有原文依据的反应"],"deep_delta_categories":["other_reaction"]}}],"cross_shard_dependencies":[{{"obligation_id":"O-prior","reason":"承接前序状态"}}]}}"#,
+            r#"{{"plan_version":"protagonist-graph-v2.1","obligations":[{{"obligation_id":"O-1","node_id":"{}","chapter_index":1,"rule_ids":["R3_CAUSAL_TRANSFORM"],"required_changes":["让药老对她的入场方式产生有原文依据的反应"],"deep_delta_categories":["other_reaction"]}}],"cross_shard_dependencies":[{{"obligation_id":"O-prior","reason":"承接前序状态"}}]}}"#,
             nodes[0].node_id
         );
 
@@ -1420,7 +1460,7 @@ mod tests {
 
     #[test]
     fn planner_rejects_dependency_objects_without_a_stable_identifier() {
-        let output = r#"{"plan_version":"protagonist-graph-v2","cross_shard_dependencies":[{"reason":"承接前序状态"}]}"#;
+        let output = r#"{"plan_version":"protagonist-graph-v2.1","cross_shard_dependencies":[{"reason":"承接前序状态"}]}"#;
         let error = parse_and_validate_rewrite_plan(output, &[], &[]).unwrap_err();
         assert!(error.contains("缺少 obligation_id、node_id 或 thread_key"));
     }
@@ -1429,7 +1469,7 @@ mod tests {
     fn planner_addition_gets_stable_ids_and_remaps_state_provenance() {
         let chapter = chapter();
         let output = r#"{
-          "plan_version":"protagonist-graph-v2",
+          "plan_version":"protagonist-graph-v2.1",
           "graph_additions":[{
             "node_id":"new-1-1",
             "chapter_index":1,
@@ -1458,8 +1498,9 @@ mod tests {
         let plan = parse_and_validate_rewrite_plan(output, &[chapter], &[]).unwrap();
 
         assert!(plan.graph_additions[0].node_id.starts_with("impact-c1-1-"));
+        assert!(plan.obligations[0].planned_state_updates.is_empty());
         assert_eq!(
-            plan.obligations[0].planned_state_updates[0].source_obligation_ids,
+            plan.planned_state_updates[0].source_obligation_ids,
             vec![plan.obligations[0].obligation_id.clone()]
         );
     }
@@ -1615,7 +1656,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let plan = RewritePlan {
-            plan_version: "protagonist-graph-v2".to_string(),
+            plan_version: "protagonist-graph-v2.1".to_string(),
             graph_additions: Vec::new(),
             obligations,
             planned_state_updates: Vec::new(),
@@ -1656,10 +1697,9 @@ mod tests {
             &coverage,
             &[],
         ));
-        assert!(crate::services::coverage::validate_state_updates(
-            &parsed_plan,
-            &parsed_plan.obligations[6].planned_state_updates,
-        )
-        .is_empty());
+        assert!(parsed_plan.obligations[6]
+            .planned_state_updates
+            .is_empty());
+        assert_eq!(parsed_plan.planned_state_updates.len(), 1);
     }
 }

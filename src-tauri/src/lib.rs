@@ -2601,7 +2601,7 @@ async fn review_shard_decision(
                     )?;
                     let repair_prompt = if rewrite_plan.is_some() {
                         format!(
-                            "审查 JSON 校验失败：{error}\n只修复 JSON 结构和字段完整性，不重新审查、不改变 coverage 状态或证据。必须保留 coverage、issues、state_updates。\n\n原审查要求：\n{prompt}\n\n待修复输出：\n{}",
+                            "审查 JSON 校验失败：{error}\n只修复 JSON 结构和字段完整性，不重新审查、不改变 coverage 状态或证据。必须保留 coverage、issues；连续性状态由系统处理，不要添加 state_updates。\n\n原审查要求：\n{prompt}\n\n待修复输出：\n{}",
                             output.text
                         )
                     } else {
@@ -3483,7 +3483,11 @@ fn detect_graph_v2_overrewrite_issues(
         "女人特有",
         "女孩子半条命",
         "母性本能",
+        "母性光辉",
+        "天生的母性",
         "女人就该",
+        "清秀的字迹",
+        "字迹清秀",
     ];
     let mut issues = Vec::new();
 
@@ -3500,8 +3504,8 @@ fn detect_graph_v2_overrewrite_issues(
                     scope: "chapter".to_string(),
                     category: "stereotype".to_string(),
                     severity: "blocking".to_string(),
-                    problem: format!("改写稿凭空加入刻意性别标签“{phrase}”。"),
-                    required_fix: "删除性别标签并恢复人物原有动机；外貌可按场景自然描写。"
+                    problem: format!("改写稿凭空加入刻板性别表达“{phrase}”。"),
+                    required_fix: "删除刻板表达并恢复人物原有动机；外貌可按场景自然描写。"
                         .to_string(),
                 });
             }
@@ -5338,7 +5342,7 @@ fn build_graph_review_decision_prompt(
 3. 逐项比较原文、契约和当前改写稿。required_changes 非空时必须拆开核对每个数组项及分号分隔硬要求；R3_PRESERVE 的 required_changes 应为空，正文保留证据即可 satisfied。partial、missed、regressed 一律 blocking。
 4. coverage.evidence 必须逐字引用当前改写稿中真实存在的短证据；同一义务有多个实质子要求时，用中文分号分隔对应的多段短引用。不得引用原文、契约、自行概括或用省略号拼接成不存在的连续句。
 5. 剧情、结果、能力、身份、关系性质、marker、边界或连续性回归均为 blocking。
-6. state_updates 只逐字段原样复制契约对象最外层 planned_state_updates（包括 value）；不要重复 obligations[].planned_state_updates 中已被后续状态覆盖的中间状态。只报告本稿确实建立且可供后文使用的状态，不得概括、改写或新增状态。
+6. 连续性状态由系统在通过后从契约确定性写入；不要输出或复制 state_updates，也不要因为状态数组的格式问题打回正文。
 7. 以下过度改写同样 blocking：凭空出现“身为女性/女人”“我一个女人”“同为女子”“枉为女性”；以女性特有的母性、柔弱、细腻、慈悲、爱美购物偏好解释行为；把普通女性关系升级为闺蜜/暧昧/母女；替换偶像、英雄、巨人、巨兽、造物主等中性词；删除或用代词代替未映射人物姓名；把后续章节内容提前复制进本章。
 8. 外貌描写本身允许存在。只有与当前身体观察、身体互动或即时反应无关，或由外貌进一步推出温柔、母性、柔弱等人格时才判过度修改。
 
@@ -5358,17 +5362,10 @@ fn build_graph_review_decision_prompt(
     "severity": "blocking",
     "problem": "具体问题",
     "required_fix": "按义务 ID 说明必须如何修复"
-  }}],
-  "state_updates": [{{
-    "thread_key": "关系线",
-    "state_type": "状态类型",
-    "value": "最新有效状态",
-    "chapter_index": 1,
-    "source_obligation_ids": ["O-..."]
   }}]
 }}
 
-只有 coverage 全部 satisfied、证据真实、issues 为空且 state_updates 与计划一致时 approved 才能为 true。
+只有 coverage 全部 satisfied、证据真实且 issues 为空时 approved 才能为 true。
 
 复检约束：
 {constraints}
@@ -9944,6 +9941,17 @@ mod tests {
         let issues = detect_graph_v2_overrewrite_issues(
             std::slice::from_ref(&chapter),
             std::slice::from_ref(&stereotyped),
+            &settings,
+        );
+        assert!(issues.iter().any(|issue| issue.category == "stereotype"));
+
+        let stereotyped_handwriting = ParsedChapterRewrite {
+            text: "萧妍用清秀的字迹记录下来，又继续收拾行李。".to_string(),
+            ..stereotyped
+        };
+        let issues = detect_graph_v2_overrewrite_issues(
+            std::slice::from_ref(&chapter),
+            std::slice::from_ref(&stereotyped_handwriting),
             &settings,
         );
         assert!(issues.iter().any(|issue| issue.category == "stereotype"));
