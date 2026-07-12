@@ -5335,7 +5335,7 @@ fn build_graph_review_decision_prompt(
 审批硬条件：
 1. 契约中的每个 obligation_id 必须在 coverage 中恰好出现一次，不能出现未知义务。
 2. 按 rule_ids 中的节点模式验收：R3_CAUSAL_TRANSFORM / R3_DERIVED_TRANSFORM 必须完成全部最小因果变化；R3_SURFACE_ADAPT 只验收身份、称谓、身体或场景相关外貌适配；R3_PRESERVE 必须确认原文中性心理、动作、关系、专名和措辞未被无故改写。不得要求所有节点产生深层变化。
-3. 逐项比较原文、契约和当前改写稿。required_changes 非空时必须拆开核对每个数组项及分号分隔硬要求；普通 R3_PRESERVE 的 required_changes 应为空，正文保留证据即可 satisfied；若同时含 R3_RESTORE_SOURCE，则必须确认 required_changes 指定的过度新增已经删除且原文中性表达已恢复。partial、missed、regressed 一律 blocking。
+3. 逐项比较原文、契约和当前改写稿。required_changes 非空时必须拆开核对每个数组项及分号分隔硬要求；R3_PRESERVE 的 required_changes 应为空，正文保留证据即可 satisfied。partial、missed、regressed 一律 blocking。
 4. coverage.evidence 必须逐字引用当前改写稿中真实存在的短证据；同一义务有多个实质子要求时，用中文分号分隔对应的多段短引用。不得引用原文、契约、自行概括或用省略号拼接成不存在的连续句。
 5. 剧情、结果、能力、身份、关系性质、marker、边界或连续性回归均为 blocking。
 6. state_updates 只逐字段原样复制契约对象最外层 planned_state_updates（包括 value）；不要重复 obligations[].planned_state_updates 中已被后续状态覆盖的中间状态。只报告本稿确实建立且可供后文使用的状态，不得概括、改写或新增状态。

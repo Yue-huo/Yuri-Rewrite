@@ -127,60 +127,7 @@ pub(crate) async fn plan_rewrite_shard(
                 repaired.reasoning.as_deref(),
                 Some(&repaired.raw_response),
             )?;
-            match parse_and_validate_rewrite_plan(
-                &repaired.text,
-                context.chapters,
-                &base_nodes,
-            ) {
-                Ok(plan) => plan,
-                Err(repair_error) => {
-                    append_ai_log(
-                        state,
-                        Some(context.novel_id),
-                        &context.profile.id,
-                        "分片改写规划修复校验",
-                        Some(context.shard_label),
-                        "warning",
-                        &repair_error,
-                        repaired.reasoning.as_deref(),
-                        Some(&repaired.raw_response),
-                    )?;
-                    let second_repair_prompt = format!(
-                        "上一次修复仍未通过确定性校验：{repair_error}\n\n请只修复这个错误并返回完整 JSON。保留全部节点和义务；R3_PRESERVE 若只是保留中性原文，则 required_changes 为空；若当前稿已有过度新增，使用 R3_PRESERVE + R3_RESTORE_SOURCE，并仅写删除新增或恢复原文的 required_changes。用于删除的指令可以引用待删除坏词，但不得把坏词作为新增要求。\n\n原始规划要求：\n{prompt}\n\n上一次修复输出：\n{}",
-                        repaired.text
-                    );
-                    let second_repaired = generate_text(
-                        &state.client,
-                        Some(state.rate_limits.clone()),
-                        &repair_profile,
-                        context.api_key,
-                        SYSTEM_REWRITE_PLAN_REPAIR,
-                        &second_repair_prompt,
-                        true,
-                    )
-                    .await?;
-                    append_ai_log(
-                        state,
-                        Some(context.novel_id),
-                        &context.profile.id,
-                        "分片改写规划二次修复",
-                        Some(context.shard_label),
-                        "success",
-                        &format_model_log_content(
-                            &second_repaired,
-                            &repair_profile,
-                            Some(true),
-                        ),
-                        second_repaired.reasoning.as_deref(),
-                        Some(&second_repaired.raw_response),
-                    )?;
-                    parse_and_validate_rewrite_plan(
-                        &second_repaired.text,
-                        context.chapters,
-                        &base_nodes,
-                    )?
-                }
-            }
+            parse_and_validate_rewrite_plan(&repaired.text, context.chapters, &base_nodes)?
         }
     };
 
