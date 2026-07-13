@@ -309,7 +309,7 @@ pub(crate) fn build_rewrite_plan_prompt(
 3. 使用反事实检验：若统一执行全局主角姓名/代词映射后，原场景的事件、心理、动作、互动、评价与关系仍自然成立，就必须选择 R3_PRESERVE；该模式 required_changes 和 deep_delta_categories 均为空，并在 preserve 中写明原样保留的中性内容。姓名和代词映射由正文阶段统一执行，不得为每个节点重复写入 required_changes。
 4. 只有身体差异、明确性别称谓、恋爱/婚姻、性别化社会角色、身体接触边界或其他有原文证据的性别因果，才选择 R3_CAUSAL_TRANSFORM 并规划最小充分变化。仅需处理原文明示的性别称谓、身体差异或场景相关外貌时选择 R3_SURFACE_ADAPT，deep_delta_categories 留空；如果只有姓名/代词替换，必须选择 R3_PRESERVE。只有前序已确认变化确实传导到本节点时选择 R3_DERIVED_TRANSFORM，并逐字列出依赖标识。
 5. 保留原著事件、结果、能力、人物动机和关系性质；不得凭空增加恋爱对象、重大事件或剧情分支。
-6. 复核原文是否漏掉主角直接出现、被提及或造成后果的节点；遗漏节点放入 graph_additions，并立即为其创建 obligation。graph_additions.node_id 使用 `new-章节index-序号`，对应 obligation.node_id 必须相同。
+6. 复核原文是否漏掉主角直接出现、被提及或造成后果的节点；遗漏节点放入 graph_additions，并立即为其创建 obligation。graph_additions.node_id 使用 `new-章节index-序号`，对应 obligation.node_id 必须相同。graph_additions 每项必须包含 node_id、chapter_index、presence_kind、participants、source_evidence、narrative_function、thread_keys；其中 narrative_function 只概括该证据在本章已发生的局部作用，不得写在 obligation 中。无遗漏时 graph_additions 返回空数组。
 7. source_evidence 必须逐字摘自原文，不得概括或改写。影响图投影中的 thread_keys 和 links 只用于定位关系线，不是内容证据；当前章节 marker 内的原文和 source_evidence 才是硬依据。每项 preserve、required_changes、downstream_effects 都只能描述该 obligation.chapter_index 章节中实际存在的内容，严禁把下一章的对话、结果或关系推进提前写入当前章契约。
 8. 如果提供“当前改写稿”，比较其与原文：已经满足深层变化的节点仍保留一项验收义务，并在 preserve 中写明保持现有处理；未满足节点和本次新要求进入修复义务，避免破坏已经成立的改写。
 9. 阅读前序分片契约。如果当前义务依赖前序 node_id、obligation_id、thread_key 或计划状态，把前序摘要中实际出现的稳定标识逐字复制到 cross_shard_dependencies。不得引用当前分片新建的标识，也不得缩写、改名或概括前序 thread_key。该字段必须是扁平字符串数组（例如 ["obligation:O-xxx", "thread:许纸与吉尔伽美什的师徒/神人关系线"]），严禁输出对象；无依赖时返回空数组。
@@ -412,6 +412,7 @@ pub(crate) fn parse_and_validate_rewrite_plan(
     base_nodes: &[SourceImpactNode],
 ) -> Result<RewritePlan, String> {
     let mut value = parse_jsonish_value(output)?;
+    normalize_plan_graph_additions(&mut value)?;
     normalize_cross_shard_dependencies(&mut value)?;
     let mut plan: RewritePlan = serde_json::from_value(value)
         .map_err(|error| format!("改写契约 JSON 字段无效：{error}"))?;
@@ -498,6 +499,38 @@ pub(crate) fn parse_and_validate_rewrite_plan(
     validate_plan_state_updates(&plan, chapters)?;
     canonicalize_plan_state_updates(&mut plan);
     Ok(plan)
+}
+
+fn normalize_plan_graph_additions(value: &mut serde_json::Value) -> Result<(), String> {
+    let Some(additions) = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("graph_additions"))
+    else {
+        return Ok(());
+    };
+    let Some(items) = additions.as_array_mut() else {
+        return Err("graph_additions 必须是数组。".to_string());
+    };
+
+    for item in items {
+        let object = item
+            .as_object_mut()
+            .ok_or_else(|| "graph_additions 只能包含节点对象。".to_string())?;
+        let has_narrative_function = object
+            .get("narrative_function")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if !has_narrative_function {
+            // narrative_function is descriptive metadata, not source evidence. A planner may
+            // correctly identify a missing node while omitting this summary; do not spend a
+            // second model call inventing metadata or fail an otherwise grounded contract.
+            object.insert(
+                "narrative_function".to_string(),
+                serde_json::Value::String("标记该原文锚点中的主角影响".to_string()),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn canonicalize_plan_state_updates(plan: &mut RewritePlan) {
@@ -1503,6 +1536,40 @@ mod tests {
             plan.planned_state_updates[0].source_obligation_ids,
             vec![plan.obligations[0].obligation_id.clone()]
         );
+    }
+
+    #[test]
+    fn planner_addition_defaults_missing_narrative_function_without_repair() {
+        let chapter = chapter();
+        let output = r#"{
+          "plan_version":"protagonist-graph-v2.2",
+          "graph_additions":[{
+            "node_id":"new-1-1",
+            "chapter_index":1,
+            "presence_kind":"mentioned",
+            "participants":["萧炎","药老"],
+            "source_evidence":"药老看了他一眼",
+            "thread_keys":["师徒"]
+          }],
+          "obligations":[{
+            "obligation_id":"O-new-1-1",
+            "node_id":"new-1-1",
+            "chapter_index":1,
+            "rule_ids":["R3_PRESERVE"],
+            "preserve":["保留药老观察萧炎的中性情节"],
+            "required_changes":[],
+            "deep_delta_categories":[]
+          }]
+        }"#;
+
+        let plan = parse_and_validate_rewrite_plan(output, &[chapter], &[]).unwrap();
+
+        assert_eq!(
+            plan.graph_additions[0].narrative_function,
+            "标记该原文锚点中的主角影响"
+        );
+        assert!(plan.graph_additions[0].node_id.starts_with("impact-c1-1-"));
+        assert_eq!(plan.obligations[0].node_id, plan.graph_additions[0].node_id);
     }
 
     #[test]
